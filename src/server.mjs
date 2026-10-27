@@ -16,6 +16,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { WebClient } from '@slack/web-api';
 
+import { loadConfig, missingTokenHelp } from './config.mjs';
 import { resolveTarget, resolveSendTarget, searchTargets, lookupUserName } from './resolver.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
@@ -29,10 +30,14 @@ import {
   listenerLogPath,
 } from './listener-singleton.mjs';
 
+for (const [key, source] of Object.entries(loadConfig())) {
+  if (source !== 'env') console.error(`slack-self-mcp: ${key} loaded from ${source}`);
+}
+
 const USER_TOKEN = process.env.SLACK_USER_TOKEN;
 if (!USER_TOKEN) {
   console.error(
-    'slack-self-mcp: SLACK_USER_TOKEN is not set. Set it in your MCP server env (xoxp-… user OAuth token). See README.',
+    `slack-self-mcp: no SLACK_USER_TOKEN (xoxp-… user OAuth token) found: ${missingTokenHelp('SLACK_USER_TOKEN')} See README.`,
   );
   process.exit(1);
 }

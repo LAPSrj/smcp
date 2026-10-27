@@ -21,13 +21,15 @@
 //   SLACK_USER_TOKEN  — xoxp-… for user/channel name resolution + auth.test
 //   SLACK_APP_TOKEN   — xapp-… for the socket connection
 //
-// Tokens are read from process.env, then from $XDG_RUNTIME_DIR/.../tokens.env
-// as a fallback (Monitor strips env when spawning children).
+// Tokens are read from process.env, the repo .env, ~/.config/slack-self-mcp/,
+// then from $XDG_RUNTIME_DIR/.../tokens.env as a fallback (Monitor strips env
+// when spawning children).
 
 import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
 import fs from 'node:fs';
 
+import { loadConfig, missingTokenHelp } from '../src/config.mjs';
 import { runtimeTokensPath, readTokens } from '../src/runtime-tokens.mjs';
 import {
   DEFAULT_TTL_MS,
@@ -44,6 +46,10 @@ import {
 } from '../src/listener-singleton.mjs';
 
 const EVENTS_ROTATE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+for (const [key, source] of Object.entries(loadConfig())) {
+  if (source !== 'env') console.error(`slack-listen: ${key} loaded from ${source}`);
+}
 
 let USER_TOKEN = process.env.SLACK_USER_TOKEN;
 let APP_TOKEN = process.env.SLACK_APP_TOKEN;
@@ -66,9 +72,8 @@ if (!USER_TOKEN || !APP_TOKEN) {
 
 function diagnoseMissingToken(name) {
   return [
-    `slack-listen: ${name} is not set in env or in the runtime tokens file (${runtimeTokensPath()}).`,
-    'The MCP server (src/server.mjs) writes that file at startup; if it is missing, the server is not running, was started without the corresponding env var, or could not write to the runtime dir.',
-    'Workaround: start the listener directly with SLACK_USER_TOKEN and SLACK_APP_TOKEN exported in env.',
+    `slack-listen: ${name} is not set in env, the repo .env, its token file, or the runtime tokens file (${runtimeTokensPath()}).`,
+    `To fix: ${missingTokenHelp(name)}`,
   ].join(' ');
 }
 

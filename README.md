@@ -273,18 +273,35 @@ cd <repo-path>
 npm install
 ```
 
-Requires Node ≥ 20. `<repo-path>` is wherever you cloned this repo; substitute
+Requires Node ≥ 20.12. `<repo-path>` is wherever you cloned this repo; substitute
 its absolute path in the snippets below.
 
 ### 3. Configure environment
 
-Copy `.env.example` to `.env` and fill in both tokens, **or** set them in the
-MCP server config (next step). The server reads from `process.env`; either
-works.
+Put the two tokens in one of these places. The server and the listener check
+them in this order and use the first one that has a token:
+
+1. The `env` block of the MCP server config (next step).
+2. A `.env` file in the repo root: copy `.env.example` to `.env` and fill it
+   in. It can also set `SLACK_SEND_FOOTER` and the other optional settings.
+3. One file per token under `~/.config/slack-self-mcp/`, the same layout the
+   Kinsta and BugHerd MCPs use. Then the MCP config doesn't need an `env`
+   block at all:
+
+   ```bash
+   mkdir -p -m 700 ~/.config/slack-self-mcp
+   install -m 600 /dev/null ~/.config/slack-self-mcp/user-token
+   install -m 600 /dev/null ~/.config/slack-self-mcp/app-token
+   # then paste xoxp-… into user-token and xapp-… into app-token
+   ```
+
+   Set `SLACK_USER_TOKEN_FILE` or `SLACK_APP_TOKEN_FILE` to read a token
+   from a different path.
 
 ### 4. Register the MCP server
 
-Add to `~/.claude/settings.json` under `mcpServers`:
+Add to `~/.claude/settings.json` under `mcpServers` (leave out `env` if the
+tokens are in `.env` or `~/.config/slack-self-mcp/`):
 
 ```json
 {
@@ -303,10 +320,10 @@ Add to `~/.claude/settings.json` under `mcpServers`:
 
 Then restart Claude Code. Tools appear as `mcp__slack-self__slack_send`, etc.
 
-> `SLACK_APP_TOKEN` is consumed by the listener, not the MCP server itself.
-> Setting it in the MCP env is required because the server publishes its env
-> tokens to a runtime file (see §Listener) that the listener reads when its
-> own env is stripped — which is what happens when Monitor spawns it.
+> `SLACK_APP_TOKEN` is used by the listener, not the MCP server itself. The
+> server still needs to find it, because it publishes both tokens to a runtime
+> file (see §Listener) that the listener reads when Monitor starts it with an
+> empty env and the tokens are only in the MCP config.
 
 ### 5. Use it from a session
 
@@ -444,7 +461,8 @@ Monitor-launched stream binary does **not** inherit `SLACK_USER_TOKEN` /
 directly (it just reads `events.jsonl`), but it does spawn the singleton
 on first boot — and the singleton DOES need them. The MCP server writes
 its tokens to `tokens.env` at startup so the singleton can read them as
-an env-stripped child.
+an env-stripped child. If the tokens are in the repo `.env` or under
+`~/.config/slack-self-mcp/`, the singleton reads them from there first.
 
 - **Path**: `$XDG_RUNTIME_DIR/slack-self-mcp/tokens.env`
 - **Mode**: file `0600`, parent dir `0700`. On a logged-in Linux session
@@ -536,6 +554,7 @@ slack-self-mcp/
 ├── .env.example
 ├── src/
 │   ├── server.mjs               # MCP stdio server (slack_send / edit / history / file_download / resolve / listen_instructions)
+│   ├── config.mjs               # loads tokens from env → repo .env → ~/.config/slack-self-mcp/
 │   ├── resolver.mjs             # target → channel ID + fuzzy candidates
 │   ├── runtime-tokens.mjs       # tokens.env handoff (server → singleton)
 │   ├── recent-sends.mjs         # recent-sends.jsonl shared dedup for echo suppression
@@ -544,6 +563,7 @@ slack-self-mcp/
 │   ├── slack-listen.mjs         # Singleton listener daemon — owns Socket Mode, writes events.jsonl
 │   └── slack-listen-stream.mjs  # Per-agent stream binary — tails+filters events.jsonl for one Monitor session
 └── test/
+    ├── config.test.mjs
     ├── recent-sends.test.mjs
     ├── listener-singleton.test.mjs
     └── slack-listen-stream.test.mjs    # run all: `npm test`
