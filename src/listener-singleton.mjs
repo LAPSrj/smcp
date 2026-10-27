@@ -50,7 +50,9 @@ function ensureDir() {
 export function heartbeatAgeMs() {
   try {
     const st = fs.statSync(heartbeatPath());
-    return Date.now() - st.mtimeMs;
+    // A newly created file's mtimeMs keeps sub-ms precision while Date.now()
+    // is truncated, so the raw difference can be slightly negative.
+    return Math.max(0, Date.now() - st.mtimeMs);
   } catch (_) { return null; }
 }
 
