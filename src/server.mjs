@@ -7,7 +7,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { fileURLToPath } from 'node:url';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -20,6 +19,7 @@ import { WebClient } from '@slack/web-api';
 import { resolveTarget, resolveSendTarget, searchTargets, lookupUserName } from './resolver.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
+import { STREAM_BINARY_PATH, buildMonitor, replyWatch } from './listen-command.mjs';
 import {
   ensureRunning as ensureSingleton,
   singletonAlive,
@@ -28,13 +28,6 @@ import {
   eventsPath,
   listenerLogPath,
 } from './listener-singleton.mjs';
-
-// Resolve script paths relative to this server file. server.mjs lives at
-// <install>/src/server.mjs; the per-agent stream binary at
-// <install>/scripts/slack-listen-stream.mjs.
-const __filename = fileURLToPath(import.meta.url);
-const PACKAGE_ROOT = path.resolve(path.dirname(__filename), '..');
-const STREAM_BINARY_PATH = path.join(PACKAGE_ROOT, 'scripts', 'slack-listen-stream.mjs');
 
 const USER_TOKEN = process.env.SLACK_USER_TOKEN;
 if (!USER_TOKEN) {
@@ -130,7 +123,8 @@ const TOOLS = [
       'so opening the same MPIM repeatedly returns the same channel. ' +
       'On a unique single match, posts text via chat.postMessage; if file_paths is non-empty, ' +
       'each file is then uploaded via files_upload_v2 and threaded under the message. ' +
-      'On ambiguous/unknown target, returns { error, candidates: [...] } — re-call with target_id from a candidate.',
+      'On ambiguous/unknown target, returns { error, candidates: [...] } — re-call with target_id from a candidate. ' +
+      'If you expect a reply, start the Monitor in the result\'s reply_watch field right after sending; it delivers both top-level and thread replies in that conversation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -421,6 +415,7 @@ async function handleSend(args) {
     ts,
     file_ids,
     resolved_target: { type: resolution.type, display: resolution.display },
+    reply_watch: replyWatch(channel_id),
   });
 }
 
@@ -554,21 +549,9 @@ async function handleListenInstructions(args = {}) {
   const channel = typeof flags.channel === 'string' && flags.channel ? flags.channel : null;
   const thread = typeof flags.thread === 'string' && flags.thread ? flags.thread : null;
 
-  const cliArgs = [];
-  if (watch_self) cliArgs.push('--watch-self');
-  if (include_subtypes) cliArgs.push('--include-subtypes');
-  if (channel) cliArgs.push('--channel', channel);
-  if (thread) cliArgs.push('--thread', thread);
-  const command = `node ${STREAM_BINARY_PATH}${cliArgs.length ? ' ' + cliArgs.join(' ') : ''}`;
-
   const tokensPath = runtimeTokensPath();
   return ok({
-    monitor: {
-      command,
-      description: 'Slack',
-      persistent: true,
-      timeout_ms: 3600000,
-    },
+    monitor: buildMonitor({ watch_self, include_subtypes, channel, thread }),
     stream_binary_path: STREAM_BINARY_PATH,
     stream_binary_exists: fs.existsSync(STREAM_BINARY_PATH),
     filters: { watch_self, include_subtypes, channel, thread },

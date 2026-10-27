@@ -55,7 +55,7 @@ slack_send(
   file_paths?: string[],
   thread_ts?: string,
 )
-  → { channel_id, ts, file_ids?, resolved_target }
+  → { channel_id, ts, file_ids?, resolved_target, reply_watch: { hint, monitor } }
   → on miss/ambiguity: { error: "no_match" | "ambiguous" | "not_a_user" | "too_many_users", input, candidates: [...], hint, failed_input?, more_available? }
 ```
 
@@ -80,6 +80,14 @@ equivalent single string.
 On a unique single match, posts text via `chat.postMessage`. If `file_paths`
 is non-empty, each file is then uploaded via `files_upload_v2` and threaded
 under the parent message.
+
+Every successful send returns `reply_watch`, a reminder plus a ready-to-run
+`Monitor` spec (same shape as `slack_listen_instructions`) filtered with
+`--channel <channel_id>`. An agent that expects an answer starts it right
+after sending, unless a Monitor it already runs covers that channel. The
+filter is channel-only so the agent gets both top-level replies and thread
+replies. `--thread` would drop top-level replies, which is how people usually
+answer in DMs.
 
 On a typo or partial name, returns up to 10 candidates with `target_id`s — the
 agent re-calls `slack_send` with one of those `target_id`s. For array form,
