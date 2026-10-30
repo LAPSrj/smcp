@@ -12,10 +12,11 @@
 // recent-sends.jsonl: $XDG_RUNTIME_DIR/slack-self-mcp/ (or /tmp/...-<uid>/).
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+
+import { runtimeDir } from './runtime-dir.mjs';
 
 export const HEARTBEAT_TTL_MS = 30_000;
 export const HEARTBEAT_TICK_MS = 10_000;
@@ -26,13 +27,6 @@ const HEARTBEAT_POLL_MS = 50;
 const __filename = fileURLToPath(import.meta.url);
 const PACKAGE_ROOT = path.resolve(path.dirname(__filename), '..');
 export const SINGLETON_LISTENER_PATH = path.join(PACKAGE_ROOT, 'scripts', 'slack-listen.mjs');
-
-function runtimeDir() {
-  const xdg = process.env.XDG_RUNTIME_DIR;
-  if (xdg && path.isAbsolute(xdg)) return path.join(xdg, 'slack-self-mcp');
-  const uid = typeof process.getuid === 'function' ? process.getuid() : 'nouid';
-  return path.join(os.tmpdir(), `slack-self-mcp-${uid}`);
-}
 
 export function heartbeatPath() { return path.join(runtimeDir(), 'listener.heartbeat'); }
 export function pidFilePath() { return path.join(runtimeDir(), 'listener.pid'); }

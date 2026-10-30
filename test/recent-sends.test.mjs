@@ -142,8 +142,15 @@ describe('recent-sends (shared, singleton-scope)', () => {
     const blocker = path.join(SANDBOX, 'not-a-dir');
     fs.writeFileSync(blocker, '');
     process.env.XDG_RUNTIME_DIR = blocker;
-    const result = mod.recordSend({ ts: '1.1', channel: 'C1' });
-    assert.equal(result, null);
+    const origTmp = process.env.TMPDIR;
+    process.env.TMPDIR = blocker;
+    try {
+      const result = mod.recordSend({ ts: '1.1', channel: 'C1' });
+      assert.equal(result, null);
+    } finally {
+      if (origTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = origTmp;
+    }
   });
 
   it('recordSend ignores empty/invalid inputs', () => {

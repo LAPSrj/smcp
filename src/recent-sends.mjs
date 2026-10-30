@@ -21,20 +21,12 @@
 // case: one self-event leaks through, which is the safer failure mode).
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+
+import { runtimeDir } from './runtime-dir.mjs';
 
 export const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_BYTES = 64 * 1024; // prune trigger; well above steady-state size
-
-function runtimeDir() {
-  const xdg = process.env.XDG_RUNTIME_DIR;
-  if (xdg && path.isAbsolute(xdg)) {
-    return path.join(xdg, 'slack-self-mcp');
-  }
-  const uid = typeof process.getuid === 'function' ? process.getuid() : 'nouid';
-  return path.join(os.tmpdir(), `slack-self-mcp-${uid}`);
-}
 
 export function recentSendsPath() {
   return path.join(runtimeDir(), 'recent-sends.jsonl');

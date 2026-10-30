@@ -9,19 +9,11 @@
 //               (the server controls what's written; tokens are opaque ASCII).
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
-const TOKEN_KEYS = ['SLACK_USER_TOKEN', 'SLACK_APP_TOKEN'];
+import { runtimeDir } from './runtime-dir.mjs';
 
-function runtimeDir() {
-  const xdg = process.env.XDG_RUNTIME_DIR;
-  if (xdg && path.isAbsolute(xdg)) {
-    return path.join(xdg, 'slack-self-mcp');
-  }
-  const uid = typeof process.getuid === 'function' ? process.getuid() : 'nouid';
-  return path.join(os.tmpdir(), `slack-self-mcp-${uid}`);
-}
+const TOKEN_KEYS = ['SLACK_USER_TOKEN', 'SLACK_APP_TOKEN'];
 
 export function runtimeTokensPath() {
   return path.join(runtimeDir(), 'tokens.env');
