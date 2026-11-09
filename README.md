@@ -78,8 +78,9 @@ new conversation is created. A length-1 array is treated the same as the
 equivalent single string.
 
 On a unique single match, posts text via `chat.postMessage`. If `file_paths`
-is non-empty, each file is then uploaded via `files_upload_v2` and threaded
-under the parent message.
+is non-empty, it instead uploads all files via `files_upload_v2` as one
+message, with the text as its comment. With `thread_ts`, either kind of post
+goes into that thread.
 
 Every successful send returns `reply_watch`, a reminder plus a ready-to-run
 `Monitor` spec (same shape as `slack_listen_instructions`) filtered with
@@ -148,6 +149,30 @@ array of 2-8 user refs (resolved to the corresponding MPIM, idempotently).
 
 Subtype-bearing messages (joins, edits, file shares) are **not** filtered —
 the agent decides what's relevant.
+
+### `slack_mark_read`
+
+```ts
+slack_mark_read(target: string | string[], ts: string, thread_ts?: string)
+  → { channel_id, resolved_target, marked: true, scope, previous_last_read, last_read }
+  → { channel_id, resolved_target, marked: false, scope, reason: "already_read" | "last_read_unknown", last_read }
+```
+
+Marks messages as read for you, moving the read position forward only.
+`target` follows the same rules as `slack_history`.
+
+- Top-level message (no `thread_ts`, or `thread_ts == ts`): calls
+  `conversations.mark`, which moves the channel's read position to `ts`.
+  Needs `channels:write`, `groups:write`, `im:write` or `mpim:write` for the
+  channel kind.
+- Thread reply (`thread_ts != ts`): calls `subscriptions.thread.mark`, which
+  moves the thread's read position. Slack doesn't document this method (it's
+  the one the Slack client uses), and it works with the history scopes.
+
+Before marking, it reads the current position (`conversations.info`
+`last_read` for a channel, the parent's `last_read` from
+`conversations.replies` for a thread). If `ts` isn't newer, or Slack doesn't
+report a position, nothing changes and `reason` says why.
 
 ### `slack_file_download`
 
@@ -250,10 +275,13 @@ Same engine as the `slack_send` fallback, exposed for introspection.
    - `mpim:history`       *(slack_history on group DMs)*
    - `reactions:read`     *(reactions on history results)*
    - `files:read`         *(slack_file_download — files.info + url_private GET)*
+   - `groups:write`       *(slack_mark_read on private channels; it also allows archive, rename, invite and kick in private channels you're in)*
 
    **If you add scopes after the initial install, you must reinstall the app
-   to the workspace** (Settings → Install App → Reinstall). The existing
-   `xoxp-…` token is invalidated and replaced; copy the new one into
+   to the workspace** (Settings → Install App → Reinstall). When `groups:write`
+   was added this way, the existing `xoxp-…` token stayed valid and gained the
+   new scope (check the `x-oauth-scopes` header of `auth.test`). If the token
+   shown on the OAuth page does change, copy the new one into
    `SLACK_USER_TOKEN`.
 4. **Event Subscriptions** → enable. Under **Subscribe to events on behalf
    of users**, add:
@@ -553,7 +581,8 @@ slack-self-mcp/
 ├── LICENSE
 ├── .env.example
 ├── src/
-│   ├── server.mjs               # MCP stdio server (slack_send / edit / history / file_download / resolve / listen_instructions)
+│   ├── server.mjs               # MCP stdio server (slack_send / edit / history / mark_read / file_download / resolve / listen_instructions)
+│   ├── mark-read.mjs            # forward-only read-position marking for slack_mark_read
 │   ├── config.mjs               # loads tokens from env → repo .env → ~/.config/slack-self-mcp/
 │   ├── resolver.mjs             # target → channel ID + fuzzy candidates
 │   ├── runtime-tokens.mjs       # tokens.env handoff (server → singleton)
@@ -566,5 +595,6 @@ slack-self-mcp/
     ├── config.test.mjs
     ├── recent-sends.test.mjs
     ├── listener-singleton.test.mjs
+    ├── mark-read.test.mjs
     └── slack-listen-stream.test.mjs    # run all: `npm test`
 ```

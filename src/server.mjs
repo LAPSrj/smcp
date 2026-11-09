@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// MCP server exposing slack_send, slack_edit, slack_resolve over stdio.
+// MCP server exposing the slack_* tools (see TOOLS) over stdio.
 // Uses the user OAuth token (xoxp-…) so messages are attributed to the human.
 
 import fs from 'node:fs';
@@ -21,6 +21,7 @@ import { resolveTarget, resolveSendTarget, searchTargets, lookupUserName } from 
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
 import { STREAM_BINARY_PATH, buildMonitor, replyWatch } from './listen-command.mjs';
+import { TS_PATTERN, markRead } from './mark-read.mjs';
 import {
   ensureRunning as ensureSingleton,
   singletonAlive,
@@ -127,7 +128,7 @@ const TOOLS = [
       'via conversations.open and posts to the resulting channel. Slack auto-includes the caller and dedupes, ' +
       'so opening the same MPIM repeatedly returns the same channel. ' +
       'On a unique single match, posts text via chat.postMessage; if file_paths is non-empty, ' +
-      'each file is then uploaded via files_upload_v2 and threaded under the message. ' +
+      'it instead uploads all files via files_upload_v2 as ONE message with text as its comment. thread_ts applies either way. ' +
       'On ambiguous/unknown target, returns { error, candidates: [...] } — re-call with target_id from a candidate. ' +
       'If you expect a reply, start the Monitor in the result\'s reply_watch field right after sending; it delivers both top-level and thread replies in that conversation.',
     inputSchema: {
@@ -150,7 +151,7 @@ const TOOLS = [
         file_paths: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Absolute paths to files to attach. Threaded under the parent message.',
+          description: 'Absolute paths to files to attach. Posted together with text as one message (in the thread if thread_ts is set).',
         },
         thread_ts: {
           type: 'string',
@@ -214,6 +215,31 @@ const TOOLS = [
         before_ts: { type: 'string', description: 'Paginate backward — passed to the API as "latest".' },
       },
       required: ['target'],
+    },
+  },
+  {
+    name: 'slack_mark_read',
+    description:
+      'Mark a message as read for the human user, moving the read position forward only. ' +
+      'Top-level message (no thread_ts, or thread_ts == ts): conversations.mark moves the channel read position to ts. ' +
+      'Thread reply (thread_ts != ts): subscriptions.thread.mark moves the thread read position (undocumented Slack method). ' +
+      'If ts is not newer than the current read position, nothing changes and the result says reason "already_read". ' +
+      'If Slack reports no read position, nothing changes and the result says reason "last_read_unknown". ' +
+      'Needs channels:write / groups:write / im:write / mpim:write on the user token for the channel kind; missing_scope means the app needs that scope and a reinstall.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' }, minItems: 1 },
+          ],
+          description: 'Same as slack_history: #channel, channel ID, @handle, user ID, email, or an array of user references for an MPIM.',
+        },
+        ts: { type: 'string', description: 'ts of the newest message to mark as read.' },
+        thread_ts: { type: 'string', description: 'Parent ts when ts is a thread reply.' },
+      },
+      required: ['target', 'ts'],
     },
   },
   {
@@ -320,6 +346,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === 'slack_send') return await handleSend(args);
     if (name === 'slack_edit') return await handleEdit(args);
     if (name === 'slack_history') return await handleHistory(args);
+    if (name === 'slack_mark_read') return await handleMarkRead(args);
     if (name === 'slack_listen_instructions') return handleListenInstructions(args);
     if (name === 'slack_file_download') return await handleFileDownload(args);
     if (name === 'slack_resolve') return await handleResolve(args);
@@ -506,6 +533,24 @@ async function handleHistory(args) {
     messages,
     has_more,
   });
+}
+
+async function handleMarkRead(args) {
+  const { target, ts, thread_ts } = args;
+  if (!isValidTarget(target)) {
+    return errorResult('target is required (string or non-empty array of strings)');
+  }
+  if (typeof ts !== 'string' || !TS_PATTERN.test(ts)) return errorResult(`ts must be a Slack timestamp like 1794248982.212609 (got ${JSON.stringify(ts)})`);
+  if (thread_ts !== undefined && (typeof thread_ts !== 'string' || !TS_PATTERN.test(thread_ts))) {
+    return errorResult(`thread_ts must be a Slack timestamp (got ${JSON.stringify(thread_ts)})`);
+  }
+
+  const resolution = await resolveSendTarget(slack, target);
+  if (resolution.error) return ok(resolution);
+  const channel_id = resolution.channel_id;
+
+  const result = await markRead(slack, { channel: channel_id, ts, thread_ts });
+  return ok({ channel_id, resolved_target: { type: resolution.type, display: resolution.display }, ...result });
 }
 
 async function shapeMessage(m) {
