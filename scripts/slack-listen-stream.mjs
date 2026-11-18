@@ -4,8 +4,8 @@
 // to stdout. One process per Monitor invocation; lightweight (no Socket
 // Mode connection of its own — the singleton owns that).
 //
-// On startup: ensures the singleton is running (idempotent spawn via
-// src/listener-singleton.mjs). On steady state: rotation-aware tail of
+// On startup and every HEARTBEAT_TICK_MS: ensures the singleton is running
+// (idempotent spawn via src/listener-singleton.mjs). On steady state: rotation-aware tail of
 // events.jsonl, filter, emit, repeat. Maintains its own per-pid heartbeat
 // file under stream-heartbeats/ so ops tooling can see who's listening.
 //
@@ -267,6 +267,30 @@ function startStreamHeartbeat() {
   process.on('exit', cleanup);
 }
 
+// The listener can die after this stream started it (a crash, a kill), and
+// nothing else would start it again. Returns a function that stops the checks.
+export function keepListenerRunning({ intervalMs = HEARTBEAT_TICK_MS, ...ensureOpts } = {}) {
+  let checking = false;
+  const timer = setInterval(async () => {
+    if (checking) return;
+    checking = true;
+    try {
+      const result = await ensureRunning(ensureOpts);
+      if (result.error) {
+        console.error(`slack-listen-stream: listener is down and could not be restarted: ${result.error}`);
+      } else if (result.spawned) {
+        console.error(`slack-listen-stream: listener was down, started a new one (pid=${result.pid})`);
+      }
+    } catch (err) {
+      console.error(`slack-listen-stream: listener check failed: ${err.message}`);
+    } finally {
+      checking = false;
+    }
+  }, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
 async function main() {
   const flags = parseArgs(process.argv);
   const filePath = flags.eventsFile ?? defaultEventsPath();
@@ -289,6 +313,7 @@ async function main() {
   }
 
   startStreamHeartbeat();
+  keepListenerRunning();
   tailLoop(filePath, flags);
 }
 

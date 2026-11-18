@@ -242,6 +242,42 @@ await new Promise(r => setTimeout(r, 60000));
   });
 });
 
+describe('keepListenerRunning', () => {
+  it('starts a new listener after the running one exits', async () => {
+    const helperUrl = new URL('../src/listener-singleton.mjs', import.meta.url).href;
+    const stubPath = path.join(SANDBOX, 'stub-short-lived.mjs');
+    fs.writeFileSync(stubPath, `
+import { writeHeartbeat, writePidFile, clearSingletonFiles } from '${helperUrl}';
+writePidFile();
+writeHeartbeat();
+await new Promise(r => setTimeout(r, 300));
+clearSingletonFiles();
+`);
+    const pidFile = path.join(SANDBOX, 'slack-self-mcp', 'listener.pid');
+    const readPid = () => { try { return fs.readFileSync(pidFile, 'utf8').trim(); } catch { return null; } };
+    const waitFor = async (pred, ms) => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline) {
+        const v = pred();
+        if (v) return v;
+        await new Promise(r => setTimeout(r, 20));
+      }
+      return null;
+    };
+
+    const stop = mod.keepListenerRunning({ intervalMs: 50, singletonPath: stubPath });
+    try {
+      const first = await waitFor(readPid, 3000);
+      assert.ok(first, 'first listener never started');
+      const second = await waitFor(() => { const p = readPid(); return p && p !== first ? p : null; }, 3000);
+      assert.ok(second, 'no new listener after the first one exited');
+    } finally {
+      stop();
+    }
+    await new Promise(r => setTimeout(r, 400));
+  });
+});
+
 describe('tailLoop rotation (in-process)', () => {
   it('keeps a line appended to the old file between the empty read and the rotation check', async () => {
     const eventsFile = path.join(SANDBOX, 'events.jsonl');
