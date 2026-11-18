@@ -76,6 +76,16 @@ async function waitForHeartbeat(ttlMs) {
   return singletonAlive();
 }
 
+// Looper kills every process whose environment has LOOPER_RUN=<id> when that
+// run stops, so the shared listener must not keep the starting run's LOOPER_*.
+export function listenerEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('LOOPER_')) delete env[key];
+  }
+  return env;
+}
+
 // Best-effort detached spawn. logFd is opened append-mode so the daemon's
 // stderr/stdout land in listener.log. The spawning process must close its
 // own copy after spawn returns — child inherits its own fd.
@@ -86,7 +96,7 @@ function spawnDetached({ singletonPath, env }) {
     const child = spawn(process.execPath, [singletonPath], {
       detached: true,
       stdio: ['ignore', logFd, logFd],
-      env: { ...process.env, ...env },
+      env: listenerEnv(env),
     });
     child.unref();
     return child.pid;

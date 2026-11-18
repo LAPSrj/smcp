@@ -176,6 +176,28 @@ main().catch(err => { console.error(err); process.exit(1); });
     assert.equal(fs.existsSync(mod.spawnLockPath()), false);
   });
 
+  it('starts the listener without the caller\'s LOOPER_* variables', { skip: !fs.existsSync('/proc/self/environ') && 'needs /proc' }, async () => {
+    const stubPath = path.join(SANDBOX, 'stub-env.mjs');
+    fs.writeFileSync(stubPath, simpleStubBody({ heartbeatDelayMs: 0, exitAfterMs: 1000 }));
+    const set = { LOOPER_RUN: 'test-run', LOOPER_TASK: 'test-task', SLACK_SELF_MCP_TEST_MARKER: 'kept' };
+    const saved = Object.fromEntries(Object.keys(set).map((k) => [k, process.env[k]]));
+    Object.assign(process.env, set);
+    try {
+      const result = await mod.ensureRunning({ singletonPath: stubPath, env: { LOOPER_RUN_DIR: '/x', EXTRA: 'y' } });
+      assert.equal(result.spawned, true, JSON.stringify(result));
+      const vars = fs.readFileSync(`/proc/${result.pid}/environ`, 'utf8').split('\0');
+      assert.deepEqual(vars.filter((v) => v.startsWith('LOOPER_')), []);
+      assert.ok(vars.includes('SLACK_SELF_MCP_TEST_MARKER=kept'));
+      assert.ok(vars.includes('EXTRA=y'));
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    await new Promise(r => setTimeout(r, 1100));
+  });
+
   it('two concurrent ensureRunning calls only spawn once', async () => {
     const stubPath = path.join(SANDBOX, 'stub-race.mjs');
     fs.writeFileSync(stubPath, simpleStubBody({ heartbeatDelayMs: 100, exitAfterMs: 800 }));
