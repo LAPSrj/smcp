@@ -213,4 +213,63 @@ await new Promise(r => setTimeout(r, 60000));
     assert.deepEqual(tsOrEvent.sort(), ['1.1', '3.3', 'slack_disconnected'].sort(),
       `unexpected stdout. stderr was: ${stderrBuf}\nstdout was: ${stdoutBuf}`);
   });
+
+  it('exits 1 when the events file cannot be reopened after a rotation', { skip: process.getuid?.() === 0 && 'root can open a 000 file' }, async () => {
+    const eventsFile = path.join(SANDBOX, 'events.jsonl');
+    fs.writeFileSync(eventsFile, '', { mode: 0o600 });
+    const stubPath = stubSingletonScript(SANDBOX);
+    const stubProc = spawn(process.execPath, [stubPath], {
+      env: { ...process.env, XDG_RUNTIME_DIR: SANDBOX },
+      detached: true, stdio: 'ignore',
+    });
+    stubProc.unref();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const child = spawn(process.execPath, [STREAM_PATH, '--events-file', eventsFile], {
+      env: { ...process.env, XDG_RUNTIME_DIR: SANDBOX },
+    });
+    let stderrBuf = '';
+    child.stderr.on('data', (c) => { stderrBuf += c.toString(); });
+    const exited = new Promise((r) => child.on('exit', (code) => r(code)));
+    await new Promise((r) => setTimeout(r, 600));
+
+    fs.renameSync(eventsFile, path.join(SANDBOX, 'events.1.jsonl'));
+    fs.writeFileSync(eventsFile, '', { mode: 0o000 });
+    const code = await Promise.race([exited, new Promise((r) => setTimeout(() => r('still running'), 1500))]);
+    if (code === 'still running') child.kill('SIGTERM');
+    stubProc.kill('SIGTERM');
+    assert.equal(code, 1, `stderr was: ${stderrBuf}`);
+  });
+});
+
+describe('tailLoop rotation (in-process)', () => {
+  it('keeps a line appended to the old file between the empty read and the rotation check', async () => {
+    const eventsFile = path.join(SANDBOX, 'events.jsonl');
+    fs.writeFileSync(eventsFile, '', { mode: 0o600 });
+    const line = (ts) => JSON.stringify({ ts, channel: 'C1', user: 'U1', is_self: false, text: ts, subtype: null, thread_ts: null, bot_id: null }) + '\n';
+
+    // Act as the listener at the worst moment: after the tail read 0 bytes and
+    // before it stats the path, append one line to the old file, rotate, and
+    // append the next line to the new file.
+    const realStat = fs.statSync;
+    fs.statSync = (p, ...rest) => {
+      if (p === eventsFile) {
+        fs.statSync = realStat;
+        fs.appendFileSync(eventsFile, line('1.1'));
+        fs.renameSync(eventsFile, path.join(SANDBOX, 'events.1.jsonl'));
+        fs.appendFileSync(eventsFile, line('2.2'));
+      }
+      return realStat(p, ...rest);
+    };
+
+    const seen = [];
+    const stop = mod.tailLoop(eventsFile, { watchSelf: false, includeSubtypes: false }, (_l, ev) => seen.push(ev.ts));
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+    } finally {
+      fs.statSync = realStat;
+      stop();
+    }
+    assert.deepEqual(seen, ['1.1', '2.2']);
+  });
 });

@@ -106,7 +106,9 @@ export function passesFilters(event, flags) {
 // whether the path's current inode differs from ours (rename happened)
 // or whether the current file size is smaller than our offset (truncation).
 // In either case, close + reopen and reset offset.
-function tailLoop(filePath, flags) {
+// onLine(line, event) receives each line that passes the filters. Returns a
+// function that stops the tail.
+export function tailLoop(filePath, flags, onLine = (line) => process.stdout.write(line + '\n')) {
   let state = openFresh(filePath, /*atEnd*/ true);
   if (!state) {
     console.error(`slack-listen-stream: could not open events file: ${filePath}`);
@@ -122,8 +124,7 @@ function tailLoop(filePath, flags) {
       bytes = fs.readSync(state.fd, buf, 0, READ_CHUNK_BYTES, state.offset);
     } catch (err) {
       console.error(`slack-listen-stream: read failed: ${err.message}`);
-      closeState();
-      state = openFresh(filePath, false);
+      reopen();
       return;
     }
     if (bytes > 0) {
@@ -134,6 +135,34 @@ function tailLoop(filePath, flags) {
     }
     // 0 bytes read — check for rotation.
     handleRotationCheck();
+  }
+
+  // A tail that can't reopen the file would never read again, so exit and
+  // let whoever runs the stream restart it.
+  function reopen() {
+    closeState();
+    state = openFresh(filePath, false);
+    if (!state) {
+      console.error(`slack-listen-stream: could not reopen events file, exiting: ${filePath}`);
+      process.exit(1);
+    }
+  }
+
+  // Read what is left of the current file, until a read returns 0 bytes.
+  function drain() {
+    const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    let bytes;
+    do {
+      try {
+        bytes = fs.readSync(state.fd, buf, 0, READ_CHUNK_BYTES, state.offset);
+      } catch (err) {
+        console.error(`slack-listen-stream: read failed while draining before reopen: ${err.message}`);
+        return;
+      }
+      state.offset += bytes;
+      lineBuffer += buf.toString('utf8', 0, bytes);
+    } while (bytes > 0);
+    flushLines();
   }
 
   function handleRotationCheck() {
@@ -148,10 +177,11 @@ function tailLoop(filePath, flags) {
       return;
     }
     // Inode change → rename (rotation) happened. Drain remaining bytes off
-    // the old fd (none here since we just read 0), then reopen.
+    // the old fd (the writer may have appended after our 0-byte read and
+    // before the rename), then reopen.
     if (pathStat.ino !== state.inode) {
-      closeState();
-      state = openFresh(filePath, false);
+      drain();
+      reopen();
       return;
     }
     // Same inode but file shrank → truncation. Reset offset.
@@ -181,7 +211,7 @@ function tailLoop(filePath, flags) {
         continue;
       }
       if (passesFilters(event, flags)) {
-        process.stdout.write(line + '\n');
+        onLine(line, event);
       }
     }
   }
@@ -192,6 +222,7 @@ function tailLoop(filePath, flags) {
   process.on('SIGTERM', teardown);
   process.on('SIGINT', teardown);
   process.on('SIGHUP', teardown);
+  return teardown;
 }
 
 // Open events.jsonl, optionally seeking to the end. Returns
