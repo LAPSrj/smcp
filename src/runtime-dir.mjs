@@ -1,5 +1,5 @@
-// Per-user runtime dir shared by every slack-self-mcp process:
-// $XDG_RUNTIME_DIR/slack-self-mcp/, or $TMPDIR/slack-self-mcp-<uid>/.
+// Per-user runtime dir shared by every slack-mcp process:
+// $XDG_RUNTIME_DIR/slack-mcp/, or $TMPDIR/slack-mcp-<uid>/.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -18,7 +18,7 @@ function usableXdgDir(xdg) {
 
 export function runtimeDir() {
   const xdg = process.env.XDG_RUNTIME_DIR;
-  if (usableXdgDir(xdg)) return path.join(xdg, 'slack-self-mcp');
+  if (usableXdgDir(xdg)) return path.join(xdg, 'slack-mcp');
   const uid = typeof process.getuid === 'function' ? process.getuid() : 'nouid';
-  return path.join(os.tmpdir(), `slack-self-mcp-${uid}`);
+  return path.join(os.tmpdir(), `slack-mcp-${uid}`);
 }

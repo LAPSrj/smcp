@@ -1,6 +1,6 @@
 // Fills process.env from on-disk config before anything reads it.
 // Precedence: the process env, then the repo-root .env, then the per-token
-// files under ~/.config/slack-self-mcp/ (paths overridable with *_FILE).
+// files under ~/.config/slack-mcp/ (paths overridable with *_FILE).
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const REPO_ENV_PATH = path.join(PACKAGE_ROOT, '.env');
-export const CONFIG_DIR = path.join(os.homedir(), '.config', 'slack-self-mcp');
+export const CONFIG_DIR = path.join(os.homedir(), '.config', 'slack-mcp');
 
 const TOKEN_FILES = {
   SLACK_USER_TOKEN: { fileVar: 'SLACK_USER_TOKEN_FILE', name: 'user-token' },

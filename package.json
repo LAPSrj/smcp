@@ -1,14 +1,14 @@
 {
-  "name": "slack-self-mcp",
+  "name": "smcp",
   "version": "0.1.0",
   "description": "Local MCP server that lets AI agents send and receive Slack messages — with file attachments — as the human user, plus a Socket Mode listener for inbound replies.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/LAPSrj/slack-self-mcp.git"
+    "url": "https://github.com/LAPSrj/smcp.git"
   },
-  "homepage": "https://github.com/LAPSrj/slack-self-mcp",
-  "bugs": "https://github.com/LAPSrj/slack-self-mcp/issues",
+  "homepage": "https://github.com/LAPSrj/smcp",
+  "bugs": "https://github.com/LAPSrj/smcp/issues",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -21,8 +21,8 @@
   ],
   "type": "module",
   "bin": {
-    "slack-self-mcp": "src/server.mjs",
-    "slack-self-listen": "scripts/slack-listen.mjs"
+    "slack-mcp": "src/server.mjs",
+    "slack-listen": "scripts/slack-listen.mjs"
   },
   "scripts": {
     "start": "node src/server.mjs",

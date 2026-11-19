@@ -1,4 +1,4 @@
-# slack-self-mcp
+# slack-mcp
 
 **Let your AI coding agents talk to you on Slack — as you.**
 
@@ -107,7 +107,7 @@ slack_send(
 - email address
 - bare string (searches both channels and users)
 
-…or an **array of 2-8 user references** — in which case slack-self opens an
+…or an **array of 2-8 user references** — in which case slack-mcp opens an
 MPIM (group DM) for that user set via `conversations.open` and posts to the
 returned channel. Each element must resolve to a user; mixing in a channel
 ref returns `not_a_user`. Self is silently dropped (Slack auto-includes the
@@ -427,15 +427,15 @@ them in this order and use the first one that has a token:
 1. The `env` block of the MCP server config (next step).
 2. A `.env` file in the repo root: copy `.env.example` to `.env` and fill it
    in. It can also set `SLACK_SEND_FOOTER` and the other optional settings.
-3. One file per token under `~/.config/slack-self-mcp/`, the same layout the
+3. One file per token under `~/.config/slack-mcp/`, the same layout the
    Kinsta and BugHerd MCPs use. Then the MCP config doesn't need an `env`
    block at all:
 
    ```bash
-   mkdir -p -m 700 ~/.config/slack-self-mcp
-   install -m 600 /dev/null ~/.config/slack-self-mcp/user-token
-   install -m 600 /dev/null ~/.config/slack-self-mcp/app-token
-   install -m 600 /dev/null ~/.config/slack-self-mcp/bot-token   # optional
+   mkdir -p -m 700 ~/.config/slack-mcp
+   install -m 600 /dev/null ~/.config/slack-mcp/user-token
+   install -m 600 /dev/null ~/.config/slack-mcp/app-token
+   install -m 600 /dev/null ~/.config/slack-mcp/bot-token   # optional
    # then paste xoxp-… into user-token, xapp-… into app-token and xoxb-… into bot-token
    ```
 
@@ -445,12 +445,12 @@ them in this order and use the first one that has a token:
 ### 4. Register the MCP server
 
 Add to `~/.claude/settings.json` under `mcpServers` (leave out `env` if the
-tokens are in `.env` or `~/.config/slack-self-mcp/`):
+tokens are in `.env` or `~/.config/slack-mcp/`):
 
 ```json
 {
   "mcpServers": {
-    "slack-self": {
+    "slack": {
       "command": "node",
       "args": ["<repo-path>/src/server.mjs"],
       "env": {
@@ -462,7 +462,7 @@ tokens are in `.env` or `~/.config/slack-self-mcp/`):
 }
 ```
 
-Then restart Claude Code. Tools appear as `mcp__slack-self__slack_send`, etc.
+Then restart Claude Code. Tools appear as `mcp__slack__slack_send`, etc.
 
 > `SLACK_APP_TOKEN` is used by the listener, not the MCP server itself. The
 > server still needs to find it, because it publishes both tokens to a runtime
@@ -472,7 +472,7 @@ Then restart Claude Code. Tools appear as `mcp__slack-self__slack_send`, etc.
 ### 5. Use it from a session
 
 ```
-mcp__slack-self__slack_send({ target: "@alex", text: "test", file_paths: ["/tmp/foo.png"] })
+mcp__slack__slack_send({ target: "@alex", text: "test", file_paths: ["/tmp/foo.png"] })
 ```
 
 ## Listener (singleton + per-agent stream)
@@ -562,7 +562,7 @@ To bring up the singleton without writing your own command, just call
 
 ### Runtime files
 
-All under `$XDG_RUNTIME_DIR/slack-self-mcp/` (or `/tmp/slack-self-mcp-<uid>/`
+All under `$XDG_RUNTIME_DIR/slack-mcp/` (or `/tmp/slack-mcp-<uid>/`
 if `XDG_RUNTIME_DIR` is unset), parent dir `0700`, every file `0600`.
 
 | File | Owner | Purpose |
@@ -612,9 +612,9 @@ directly (it just reads `events.jsonl`), but it does spawn the singleton
 on first boot — and the singleton DOES need them. The MCP server writes
 its tokens to `tokens.env` at startup so the singleton can read them as
 an env-stripped child. If the tokens are in the repo `.env` or under
-`~/.config/slack-self-mcp/`, the singleton reads them from there first.
+`~/.config/slack-mcp/`, the singleton reads them from there first.
 
-- **Path**: `$XDG_RUNTIME_DIR/slack-self-mcp/tokens.env`
+- **Path**: `$XDG_RUNTIME_DIR/slack-mcp/tokens.env`
 - **Mode**: file `0600`, parent dir `0700`. On a logged-in Linux session
   `$XDG_RUNTIME_DIR` is itself a `0700` tmpfs that gets cleared at logout.
 - **Format**: dotenv-style `KEY=value` lines.
@@ -697,7 +697,7 @@ suppressed (no footer at all).
 ## Files
 
 ```
-slack-self-mcp/
+slack-mcp/
 ├── package.json
 ├── README.md
 ├── LICENSE
@@ -706,7 +706,7 @@ slack-self-mcp/
 │   ├── server.mjs               # MCP stdio server (slack_send / edit / history / mark_read / file_download / resolve / search / listen_instructions)
 │   ├── messages.mjs             # permalinks, search results, user profiles, post_at parsing
 │   ├── mark-read.mjs            # forward-only read-position marking for slack_mark_read
-│   ├── config.mjs               # loads tokens from env → repo .env → ~/.config/slack-self-mcp/
+│   ├── config.mjs               # loads tokens from env → repo .env → ~/.config/slack-mcp/
 │   ├── resolver.mjs             # target → channel ID + fuzzy candidates
 │   ├── runtime-tokens.mjs       # tokens.env handoff (server → singleton)
 │   ├── recent-sends.mjs         # recent-sends.jsonl shared dedup for echo suppression

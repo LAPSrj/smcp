@@ -9,7 +9,7 @@
 // double-spawns when several MCP boots see a stale heartbeat at once.
 //
 // All files live in the same per-user runtime dir as tokens.env and
-// recent-sends.jsonl: $XDG_RUNTIME_DIR/slack-self-mcp/ (or /tmp/...-<uid>/).
+// recent-sends.jsonl: $XDG_RUNTIME_DIR/slack-mcp/ (or /tmp/...-<uid>/).
 
 import fs from 'node:fs';
 import path from 'node:path';

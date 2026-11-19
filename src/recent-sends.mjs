@@ -9,8 +9,8 @@
 // model, all tabs share the user token, so all sends are "ours" and
 // should be deduped equally.
 //
-// Layout:  $XDG_RUNTIME_DIR/slack-self-mcp/recent-sends.jsonl
-// Fallback dir: /tmp/slack-self-mcp-<uid>/                  (mkdir -m 0700)
+// Layout:  $XDG_RUNTIME_DIR/slack-mcp/recent-sends.jsonl
+// Fallback dir: /tmp/slack-mcp-<uid>/                  (mkdir -m 0700)
 // File mode: 0600
 // Format:   one JSON object per line: {"ts":"…","channel":"…","sent_at":<ms>}
 //

@@ -263,7 +263,7 @@ writeHeartbeat();
 await new Promise(r => setTimeout(r, 300));
 clearSingletonFiles();
 `);
-    const pidFile = path.join(SANDBOX, 'slack-self-mcp', 'listener.pid');
+    const pidFile = path.join(SANDBOX, 'slack-mcp', 'listener.pid');
     const readPid = () => { try { return fs.readFileSync(pidFile, 'utf8').trim(); } catch { return null; } };
     const waitFor = async (pred, ms) => {
       const deadline = Date.now() + ms;

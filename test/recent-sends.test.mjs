@@ -15,7 +15,7 @@ let SANDBOX;
 let mod;
 
 beforeEach(async () => {
-  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-self-mcp-test-'));
+  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-mcp-test-'));
   process.env.XDG_RUNTIME_DIR = SANDBOX;
   const cacheBust = `?b=${Date.now()}-${Math.random()}`;
   mod = await import(`../src/recent-sends.mjs${cacheBust}`);

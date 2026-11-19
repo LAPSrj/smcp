@@ -12,7 +12,7 @@ const UID = process.getuid();
 let SANDBOX;
 
 beforeEach(() => {
-  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-self-mcp-rtdir-'));
+  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-mcp-rtdir-'));
   process.env.TMPDIR = path.join(SANDBOX, 'tmp');
 });
 
@@ -27,12 +27,12 @@ afterEach(() => {
 describe('runtimeDir', () => {
   it('uses $XDG_RUNTIME_DIR when it is an existing writable dir', () => {
     process.env.XDG_RUNTIME_DIR = SANDBOX;
-    assert.equal(runtimeDir(), path.join(SANDBOX, 'slack-self-mcp'));
+    assert.equal(runtimeDir(), path.join(SANDBOX, 'slack-mcp'));
   });
 
   it('falls back to tmpdir when $XDG_RUNTIME_DIR does not exist', () => {
     process.env.XDG_RUNTIME_DIR = path.join(SANDBOX, 'missing', '1000');
-    assert.equal(runtimeDir(), path.join(SANDBOX, 'tmp', `slack-self-mcp-${UID}`));
+    assert.equal(runtimeDir(), path.join(SANDBOX, 'tmp', `slack-mcp-${UID}`));
   });
 
   it('falls back to tmpdir when $XDG_RUNTIME_DIR is not writable', () => {
@@ -40,15 +40,15 @@ describe('runtimeDir', () => {
     fs.mkdirSync(ro, { mode: 0o500 });
     process.env.XDG_RUNTIME_DIR = ro;
     const expected = UID === 0
-      ? path.join(ro, 'slack-self-mcp')
-      : path.join(SANDBOX, 'tmp', `slack-self-mcp-${UID}`);
+      ? path.join(ro, 'slack-mcp')
+      : path.join(SANDBOX, 'tmp', `slack-mcp-${UID}`);
     assert.equal(runtimeDir(), expected);
   });
 
   it('falls back to tmpdir when $XDG_RUNTIME_DIR is unset or relative', () => {
     delete process.env.XDG_RUNTIME_DIR;
-    assert.equal(runtimeDir(), path.join(SANDBOX, 'tmp', `slack-self-mcp-${UID}`));
+    assert.equal(runtimeDir(), path.join(SANDBOX, 'tmp', `slack-mcp-${UID}`));
     process.env.XDG_RUNTIME_DIR = 'relative/dir';
-    assert.equal(runtimeDir(), path.join(SANDBOX, 'tmp', `slack-self-mcp-${UID}`));
+    assert.equal(runtimeDir(), path.join(SANDBOX, 'tmp', `slack-mcp-${UID}`));
   });
 });

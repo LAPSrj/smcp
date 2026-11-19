@@ -3,8 +3,8 @@
 // stripped env). Tokens land in the user's runtime tmpfs, mode 0600 — see
 // README §Listener for the threat-model rationale.
 //
-// File layout:  $XDG_RUNTIME_DIR/slack-self-mcp/tokens.env
-// Fallback:     /tmp/slack-self-mcp-<uid>/tokens.env  (mkdir -m 0700)
+// File layout:  $XDG_RUNTIME_DIR/slack-mcp/tokens.env
+// Fallback:     /tmp/slack-mcp-<uid>/tokens.env  (mkdir -m 0700)
 // Format:       dotenv-style KEY=value, one per line. Quotes/escapes not used
 //               (the server controls what's written; tokens are opaque ASCII).
 

@@ -12,7 +12,7 @@ let SANDBOX;
 let mod;
 
 beforeEach(async () => {
-  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-self-mcp-singleton-'));
+  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-mcp-singleton-'));
   process.env.XDG_RUNTIME_DIR = SANDBOX;
   const cacheBust = `?b=${Date.now()}-${Math.random()}`;
   mod = await import(`../src/listener-singleton.mjs${cacheBust}`);
@@ -25,8 +25,8 @@ afterEach(() => {
 });
 
 describe('listener-singleton paths', () => {
-  it('all runtime files live under $XDG_RUNTIME_DIR/slack-self-mcp', () => {
-    const dir = path.join(SANDBOX, 'slack-self-mcp');
+  it('all runtime files live under $XDG_RUNTIME_DIR/slack-mcp', () => {
+    const dir = path.join(SANDBOX, 'slack-mcp');
     assert.equal(mod.heartbeatPath(), path.join(dir, 'listener.heartbeat'));
     assert.equal(mod.pidFilePath(), path.join(dir, 'listener.pid'));
     assert.equal(mod.spawnLockPath(), path.join(dir, 'listener.spawn.lock'));
@@ -179,7 +179,7 @@ main().catch(err => { console.error(err); process.exit(1); });
   it('starts the listener without the caller\'s LOOPER_* variables', { skip: !fs.existsSync('/proc/self/environ') && 'needs /proc' }, async () => {
     const stubPath = path.join(SANDBOX, 'stub-env.mjs');
     fs.writeFileSync(stubPath, simpleStubBody({ heartbeatDelayMs: 0, exitAfterMs: 1000 }));
-    const set = { LOOPER_RUN: 'test-run', LOOPER_TASK: 'test-task', SLACK_SELF_MCP_TEST_MARKER: 'kept' };
+    const set = { LOOPER_RUN: 'test-run', LOOPER_TASK: 'test-task', SLACK_MCP_TEST_MARKER: 'kept' };
     const saved = Object.fromEntries(Object.keys(set).map((k) => [k, process.env[k]]));
     Object.assign(process.env, set);
     try {
@@ -187,7 +187,7 @@ main().catch(err => { console.error(err); process.exit(1); });
       assert.equal(result.spawned, true, JSON.stringify(result));
       const vars = fs.readFileSync(`/proc/${result.pid}/environ`, 'utf8').split('\0');
       assert.deepEqual(vars.filter((v) => v.startsWith('LOOPER_')), []);
-      assert.ok(vars.includes('SLACK_SELF_MCP_TEST_MARKER=kept'));
+      assert.ok(vars.includes('SLACK_MCP_TEST_MARKER=kept'));
       assert.ok(vars.includes('EXTRA=y'));
     } finally {
       for (const [k, v] of Object.entries(saved)) {

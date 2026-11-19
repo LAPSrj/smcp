@@ -34,19 +34,19 @@ import {
 } from './listener-singleton.mjs';
 
 for (const [key, source] of Object.entries(loadConfig())) {
-  if (source !== 'env') console.error(`slack-self-mcp: ${key} loaded from ${source}`);
+  if (source !== 'env') console.error(`slack-mcp: ${key} loaded from ${source}`);
 }
 
 const USER_TOKEN = process.env.SLACK_USER_TOKEN;
 if (!USER_TOKEN) {
   console.error(
-    `slack-self-mcp: no SLACK_USER_TOKEN (xoxp-… user OAuth token) found: ${missingTokenHelp('SLACK_USER_TOKEN')} See README.`,
+    `slack-mcp: no SLACK_USER_TOKEN (xoxp-… user OAuth token) found: ${missingTokenHelp('SLACK_USER_TOKEN')} See README.`,
   );
   process.exit(1);
 }
 if (!USER_TOKEN.startsWith('xoxp-')) {
   console.error(
-    `slack-self-mcp: SLACK_USER_TOKEN does not start with "xoxp-". This MCP requires a user OAuth token so messages are sent as the human user. Got prefix: ${USER_TOKEN.slice(0, 5)}…`,
+    `slack-mcp: SLACK_USER_TOKEN does not start with "xoxp-". This MCP requires a user OAuth token so messages are sent as the human user. Got prefix: ${USER_TOKEN.slice(0, 5)}…`,
   );
   process.exit(1);
 }
@@ -66,7 +66,7 @@ if (BOT_TOKEN.startsWith('xoxb-')) {
   bot = new WebClient(BOT_TOKEN);
 } else if (BOT_TOKEN) {
   console.error(
-    `slack-self-mcp: SLACK_BOT_TOKEN does not start with "xoxb-", so every message is sent as the user. Got prefix: ${BOT_TOKEN.slice(0, 5)}…`,
+    `slack-mcp: SLACK_BOT_TOKEN does not start with "xoxb-", so every message is sent as the user. Got prefix: ${BOT_TOKEN.slice(0, 5)}…`,
   );
 }
 // "@me" is the DM where agents reach the user: the one with the bot, which
@@ -90,7 +90,7 @@ async function expandMe(target) {
       try {
         dm = await botUserId();
       } catch (err) {
-        console.error(`slack-self-mcp: bot auth.test failed, @me falls back to the self-DM: ${formatSlackError(err)}`);
+        console.error(`slack-mcp: bot auth.test failed, @me falls back to the self-DM: ${formatSlackError(err)}`);
       }
     }
     meIds = { self, dm };
@@ -122,7 +122,7 @@ const BOT_IDENTITY = Object.fromEntries(
   [['username', process.env.SLACK_BOT_USERNAME], ['icon_url', process.env.SLACK_BOT_ICON_URL]].filter(([, v]) => v),
 );
 
-// Hand off tokens to the listener via $XDG_RUNTIME_DIR/slack-self-mcp/tokens.env
+// Hand off tokens to the listener via $XDG_RUNTIME_DIR/slack-mcp/tokens.env
 // (mode 0600, in user-private tmpfs). Monitor strips env from spawned children;
 // rather than push tokens into the listener's command line — visible in
 // `ps`/`/proc/*/cmdline` to other processes — the server publishes them to a
@@ -141,13 +141,13 @@ function ensureRuntimeTokens() {
       SLACK_BOT_TOKEN: bot ? BOT_TOKEN : '',
     });
   } catch (err) {
-    console.error(`slack-self-mcp: could not write runtime tokens: ${err.message}`);
+    console.error(`slack-mcp: could not write runtime tokens: ${err.message}`);
     return null;
   }
 }
 let RUNTIME_TOKENS_PATH = ensureRuntimeTokens();
 if (RUNTIME_TOKENS_PATH) {
-  console.error(`slack-self-mcp: wrote runtime tokens to ${RUNTIME_TOKENS_PATH}`);
+  console.error(`slack-mcp: wrote runtime tokens to ${RUNTIME_TOKENS_PATH}`);
 }
 
 // Bring up the singleton Slack listener at server boot. Best-effort —
@@ -156,14 +156,14 @@ if (RUNTIME_TOKENS_PATH) {
 // only required for the slack_listen_instructions consumer flow.
 ensureSingleton().then((result) => {
   if (result.error) {
-    console.error(`slack-self-mcp: singleton listener ensure failed: ${result.error}`);
+    console.error(`slack-mcp: singleton listener ensure failed: ${result.error}`);
   } else if (result.alreadyRunning) {
-    console.error(`slack-self-mcp: singleton listener alive (pid=${result.pid}, heartbeat_age=${result.heartbeat_age_ms}ms)`);
+    console.error(`slack-mcp: singleton listener alive (pid=${result.pid}, heartbeat_age=${result.heartbeat_age_ms}ms)`);
   } else if (result.spawned) {
-    console.error(`slack-self-mcp: spawned singleton listener (pid=${result.pid})${result.warning ? ` warning=${result.warning}` : ''}`);
+    console.error(`slack-mcp: spawned singleton listener (pid=${result.pid})${result.warning ? ` warning=${result.warning}` : ''}`);
   }
 }).catch((err) => {
-  console.error(`slack-self-mcp: singleton ensure threw: ${err.message}`);
+  console.error(`slack-mcp: singleton ensure threw: ${err.message}`);
 });
 
 // Footer appended to text messages so recipients can tell the post came
@@ -207,7 +207,7 @@ const TOOLS = [
       'and nothing is sent as the human if the bot can\'t post. as "user" always posts as the human. ' +
       'target accepts a single reference (#channel-name, channel ID C…/G…, @handle, user ID U…, email, or @me for the DM where you reach the human: ' +
       'their DM with the bot, or their self-DM when no bot token is set) ' +
-      'OR an array of 2-8 user references — in which case slack-self opens an MPIM (group DM) for that user set ' +
+      'OR an array of 2-8 user references — in which case slack-mcp opens an MPIM (group DM) for that user set ' +
       'via conversations.open and posts to the resulting channel. Slack auto-includes the caller and dedupes, ' +
       'so opening the same MPIM repeatedly returns the same channel. ' +
       'On a unique single match, posts text via chat.postMessage; if file_paths is non-empty, ' +
@@ -472,7 +472,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: 'slack-self-mcp', version: '0.1.0' },
+  { name: 'slack-mcp', version: '0.1.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -986,4 +986,4 @@ async function handleSearch(args) {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 // stderr ok; stdout is reserved for MCP framing.
-console.error(`slack-self-mcp: ready (${bot ? 'bot first, user fallback' : 'user-token mode'})`);
+console.error(`slack-mcp: ready (${bot ? 'bot first, user fallback' : 'user-token mode'})`);

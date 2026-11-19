@@ -22,7 +22,7 @@
 //   SLACK_APP_TOKEN   — xapp-… for the socket connection
 //   SLACK_BOT_TOKEN   — optional xoxb-…, only to recognize the bot's own posts
 //
-// Tokens are read from process.env, the repo .env, ~/.config/slack-self-mcp/,
+// Tokens are read from process.env, the repo .env, ~/.config/slack-mcp/,
 // then from $XDG_RUNTIME_DIR/.../tokens.env as a fallback (Monitor strips env
 // when spawning children).
 

@@ -1,5 +1,5 @@
 // Tests for src/config.mjs: token and setting lookup from env, the repo .env,
-// and ~/.config/slack-self-mcp/. Every test passes its own env object and
+// and ~/.config/slack-mcp/. Every test passes its own env object and
 // paths, so nothing reads the real .env or home config.
 
 import { strict as assert } from 'node:assert';
@@ -20,9 +20,9 @@ function write(file, content) {
 }
 
 beforeEach(() => {
-  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-self-mcp-config-'));
+  SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'slack-mcp-config-'));
   envFile = path.join(SANDBOX, 'repo', '.env');
-  configDir = path.join(SANDBOX, 'home', '.config', 'slack-self-mcp');
+  configDir = path.join(SANDBOX, 'home', '.config', 'slack-mcp');
 });
 
 afterEach(() => {
@@ -56,7 +56,7 @@ describe('loadConfig', () => {
     assert.equal(sources.SLACK_USER_TOKEN, envFile);
   });
 
-  it('reads trimmed tokens from ~/.config/slack-self-mcp/', () => {
+  it('reads trimmed tokens from ~/.config/slack-mcp/', () => {
     write(path.join(configDir, 'user-token'), '  xoxp-file\n');
     write(path.join(configDir, 'app-token'), 'xapp-file\n');
     const env = {};
