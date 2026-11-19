@@ -13,7 +13,7 @@ import path from 'node:path';
 
 import { runtimeDir } from './runtime-dir.mjs';
 
-const TOKEN_KEYS = ['SLACK_USER_TOKEN', 'SLACK_APP_TOKEN'];
+const TOKEN_KEYS = ['SLACK_USER_TOKEN', 'SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN'];
 
 export function runtimeTokensPath() {
   return path.join(runtimeDir(), 'tokens.env');

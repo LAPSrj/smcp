@@ -24,7 +24,7 @@ What that buys you:
 A typical exchange:
 
 ```
-# agent posts in your DM with itself, attaching a screenshot
+# agent posts in your DM with the bot (your self-DM without a bot token), attaching a screenshot
 slack_send({ target: "@me", text: "PR ready — preview attached", file_paths: ["/tmp/diff.png"] })
 
 # you reply from your phone; the listener emits to the agent's Monitor:
@@ -44,6 +44,38 @@ stuck. This server fills that gap by going through a Slack **user** OAuth
 token (`xoxp-`), so posts land as you — in real channels and DMs — with
 files actually attached.
 
+## Posting as a bot
+
+With an optional bot token (`xoxb-`, from the same Slack app), `slack_send`
+and `slack_edit` try the bot first, so messages show up under the app's own
+name and icon with Slack's APP badge. Reading, resolving and downloading
+still use your user token, so the server sees everything you can see.
+
+The bot can only post where it is a member: any public channel (with
+`chat:write.public`), private channels it was invited to, and its own DMs.
+Slack doesn't let a bot post in a DM between two people or in a group DM,
+and returns `channel_not_found` there. When the bot fails for any reason, the
+send or edit is retried as you, with the footer. The result says which one
+posted (`posted_as` / `edited_as`) and, after a fallback, why the bot failed
+(`bot_error`).
+
+To send only as the bot, pass `as: "bot"` to `slack_send`: a person as the
+target then means the bot's own DM with them (opened with `im:write`), and
+nothing is sent as you if the bot can't post. You can't see that DM in
+Slack; replies to it reach the listener through the bot's events.
+`as: "user"` always posts as you, and the default `as: "auto"` is the
+bot-then-you behavior above.
+
+A channel ID your user token can't see, such as someone's DM with the bot,
+is resolved with the bot token instead, so `slack_send` posts there as the
+bot and `slack_history` reads it as the bot (`resolved_target.display` is
+"bot DM with @name"). The bot needs `im:read` / `mpim:read` for this.
+
+`SLACK_BOT_USERNAME` and `SLACK_BOT_ICON_URL` override the name and icon on
+text posts (needs `chat:write.customize`). Slack ignores them on file
+uploads, which always show the app's own name and icon. Leave them unset to
+use the name and icon from the app's Basic Information page.
+
 ## Tools
 
 ### `slack_send`
@@ -54,8 +86,13 @@ slack_send(
   text?: string,
   file_paths?: string[],
   thread_ts?: string,
+  format?: "markdown" | "mrkdwn",   // default "markdown"
+  reply_broadcast?: boolean,        // with thread_ts: also show the reply in the channel
+  unfurl?: boolean,                 // link and media previews on/off; omit for Slack's default
+  post_at?: number | string,        // schedule: Unix seconds or ISO 8601 with an offset
 )
-  → { channel_id, ts, file_ids?, resolved_target, reply_watch: { hint, monitor } }
+  → { channel_id, ts, permalink, file_ids?, posted_as: "bot" | "user", bot_error?, resolved_target, reply_watch: { hint, monitor } }
+  → with post_at: { channel_id, scheduled_message_id, post_at, scheduled_as: "bot" | "user", bot_error?, resolved_target }
   → on miss/ambiguity: { error: "no_match" | "ambiguous" | "not_a_user" | "too_many_users", input, candidates: [...], hint, failed_input?, more_available? }
 ```
 
@@ -63,6 +100,8 @@ slack_send(
 
 - `#channel-name`
 - channel ID (`C…` / `G…`)
+- `@me` — your DM with the bot when a bot token is set, so the bot's messages
+  notify you and your replies reach the listener; your self-DM without one
 - `@handle`
 - user ID (`U…` / `W…`)
 - email address
@@ -80,7 +119,24 @@ equivalent single string.
 On a unique single match, posts text via `chat.postMessage`. If `file_paths`
 is non-empty, it instead uploads all files via `files_upload_v2` as one
 message, with the text as its comment. With `thread_ts`, either kind of post
-goes into that thread.
+goes into that thread. The result's `permalink` is the message's Slack link.
+
+Text is sent as standard Markdown by default (`format: "markdown"`):
+`**bold**`, `~~strike~~`, `[text](url)`, tables and headings, through
+`markdown_text`, or as a `markdown` block on a file upload. `format:
+"mrkdwn"` is Slack's own syntax, which is how earlier versions sent
+everything. Mentions (`<@U…>`, `<#C…>`, `<!here>`) and `<url|text>` links
+work in both. Only `*bold*` (italic in Markdown) and `~strike~` (literal
+tildes in Markdown) need `"mrkdwn"`.
+
+`post_at` schedules the message with `chat.scheduleMessage` instead of
+sending it now, as the bot first and then as you, like a normal send. Slack
+needs the time in the future and at most 120 days out. An ISO time without
+an offset is rejected, so the machine's timezone never applies by accident.
+The result has `scheduled_message_id` and no `ts`. You cancel or edit a
+scheduled message in Slack's "Drafts & sent" view. `post_at`,
+`reply_broadcast` and `unfurl` work on text messages only, not with
+`file_paths`.
 
 Every successful send returns `reply_watch`, a reminder plus a ready-to-run
 `Monitor` spec (same shape as `slack_listen_instructions`) filtered with
@@ -98,12 +154,13 @@ trip required.
 ### `slack_edit`
 
 ```ts
-slack_edit(channel_id: string, ts: string, text: string)
-  → { channel_id, ts }
+slack_edit(channel_id: string, ts: string, text: string, format?: "markdown" | "mrkdwn")   // default "markdown"
+  → { channel_id, ts, edited_as: "bot" | "user" }
 ```
 
-Calls `chat.update`. With a user token Slack only allows editing messages the
-same user posted; the API error is surfaced verbatim if it fails. `text`
+Calls `chat.update`. Slack only lets each token edit its own messages, so it
+tries the bot token first and then the user token; the user token's API
+error is surfaced verbatim if both fail. `text`
 fully replaces the previous text (this is not a delta API). For threaded
 replies, `ts` is the reply's own `ts` (not the parent `thread_ts`).
 
@@ -115,8 +172,10 @@ slack_history(
   limit?: number,
   thread_ts?: string,
   before_ts?: string,
+  after_ts?: string,
+  cursor?: string,
 )
-  → { channel_id, resolved_target, messages: Message[], has_more: boolean }
+  → { channel_id, resolved_target, messages: Message[], has_more: boolean, next_cursor: string | null }
   → on miss/ambiguity: { error, candidates, hint, more_available? }   // same shape as slack_send
 ```
 
@@ -124,11 +183,13 @@ slack_history(
 array of 2-8 user refs (resolved to the corresponding MPIM, idempotently).
 
 - Without `thread_ts`: recent messages in the channel/DM via
-  `conversations.history`.
-- With `thread_ts`: full reply set via `conversations.replies` (Slack returns
-  the parent as the first item — preserved).
-- `before_ts` paginates backward (passed as the API's `latest` cursor).
-- `limit` defaults to 20, capped at 100.
+  `conversations.history`, newest first.
+- With `thread_ts`: full reply set via `conversations.replies`, oldest first
+  (Slack returns the parent as the first item — preserved).
+- `before_ts` and `after_ts` bound the time range (the API's `latest` and
+  `oldest`). `after_ts` reads what is new since a message.
+- `cursor` takes `next_cursor` from the previous result for the next page.
+- `limit` defaults to 20, capped at 100, or 1000 with `thread_ts`.
 
 `Message` shape:
 
@@ -138,7 +199,9 @@ array of 2-8 user refs (resolved to the corresponding MPIM, idempotently).
   user: string | null,            // U…
   user_name: string | null,       // resolved display name
   text: string,
+  permalink: string,              // same link chat.getPermalink returns
   thread_ts?: string,
+  reply_count?: number,           // thread parents only, with reply_users_count and latest_reply
   subtype?: string,               // "bot_message", "file_share", "channel_join", …
   bot_id?: string,
   edited?: { user, ts },
@@ -243,11 +306,43 @@ off the same shared singleton.
 ### `slack_resolve`
 
 ```ts
-slack_resolve(target: string)
-  → { matches: [{ target_id, type, display, name?, real_name?, email? }, …], more_available? }
+slack_resolve(target: string, profile?: boolean)
+  → { matches: [{ target_id, type, display, name?, real_name?, email?, title?, topic?, purpose?, num_members?, is_archived? }, …], more_available? }
+  → with profile: { profile: { id, name, real_name, display_name, title, email, phone, tz, tz_label, local_time,
+                               status_text, status_emoji, status_expiration, presence, is_bot, is_admin, is_guest, deleted } }
 ```
 
-Same engine as the `slack_send` fallback, exposed for introspection.
+Same engine as the `slack_send` fallback, plus matches on a channel's topic
+or purpose and a person's job title, ranked after name matches. Archived
+channels are listed last with `is_archived: true` (`slack_send` skips them).
+
+With `profile: true` and a target that names one person (`@me` is you here,
+not the bot DM), it returns that person's profile, including their local time
+now and presence (`active` / `away`). When the target matches several people,
+it returns the candidates instead.
+
+### `slack_search`
+
+```ts
+slack_search(
+  query: string,                    // Slack search syntax, e.g. 'deploy in:#dev-team after:2026-11-01'
+  content?: "messages" | "files",   // default "messages"
+  sort?: "score" | "timestamp",     // default "score"
+  sort_dir?: "desc" | "asc",        // default "desc"
+  limit?: number,                   // default 20, capped at 100
+  page?: number,                    // default 1
+)
+  → { total, page, pages, messages: [{ channel_id, channel_name, channel_type, ts, thread_ts?, user, user_name, text, permalink, files? }] }
+  → with content "files": { total, page, pages, files: [{ id, name, title, mimetype, size, user, created, channels, permalink, url_private }] }
+```
+
+Calls `search.messages` or `search.files` with your user token (needs
+`search:read`), so it covers every conversation you can see: public and
+private channels, DMs and group DMs. `query` takes Slack's modifiers
+(`in:`, `from:`, `with:`, `has:`, `is:thread`, `before:`, `after:`, `on:`,
+`during:`). A thread reply's `thread_ts` comes from its permalink, since
+the search API doesn't return it as a field. It is keyword search only,
+without the claude.ai connector's semantic ranking.
 
 ## Setup
 
@@ -276,6 +371,8 @@ Same engine as the `slack_send` fallback, exposed for introspection.
    - `reactions:read`     *(reactions on history results)*
    - `files:read`         *(slack_file_download — files.info + url_private GET)*
    - `groups:write`       *(slack_mark_read on private channels; it also allows archive, rename, invite and kick in private channels you're in)*
+   - `channels:write`     *(slack_mark_read on public channels; it also allows creating, archiving and renaming public channels and inviting and removing people)*
+   - `search:read`        *(slack_search)*
 
    **If you add scopes after the initial install, you must reinstall the app
    to the workspace** (Settings → Install App → Reinstall). When `groups:write`
@@ -283,14 +380,32 @@ Same engine as the `slack_send` fallback, exposed for introspection.
    new scope (check the `x-oauth-scopes` header of `auth.test`). If the token
    shown on the OAuth page does change, copy the new one into
    `SLACK_USER_TOKEN`.
+   For the optional bot (see §Posting as a bot), also add under **Bot Token
+   Scopes**:
+   - `chat:write`
+   - `chat:write.public`    *(post in public channels without an invite)*
+   - `chat:write.customize` *(only for `SLACK_BOT_USERNAME` / `SLACK_BOT_ICON_URL`)*
+   - `files:write`
+   - `channels:history`, `groups:history`, `im:history`, `mpim:history`
+     *(bot events below, and finding the ts of a file the bot posted)*
+   - `im:read`, `mpim:read` *(reading people's DMs with the bot)*
+   - `im:write` *(opening the bot's DM with someone, for `as: "bot"`)*
 4. **Event Subscriptions** → enable. Under **Subscribe to events on behalf
    of users**, add:
    - `message.channels`
    - `message.groups`
    - `message.im`
    - `message.mpim`
+
+   For the bot, add the same four under **Subscribe to bot events**, so the
+   listener also gets messages in conversations only the bot is in (people
+   writing to it directly, public channels you aren't in). For people to
+   write to the bot, turn on **App Home → Messages Tab** and allow users to
+   send messages from it. Set the bot's name and icon under **Basic
+   Information → Display Information**.
 5. **Install App** → install to the workspace. Copy the **User OAuth Token**
-   (`xoxp-…`) — this is `SLACK_USER_TOKEN`.
+   (`xoxp-…`) — this is `SLACK_USER_TOKEN` — and, with bot scopes, the **Bot
+   User OAuth Token** (`xoxb-…`) — this is `SLACK_BOT_TOKEN`.
 6. For private channels you want the MCP to post into, manually invite your
    user (the token holder is you).
 
@@ -320,11 +435,12 @@ them in this order and use the first one that has a token:
    mkdir -p -m 700 ~/.config/slack-self-mcp
    install -m 600 /dev/null ~/.config/slack-self-mcp/user-token
    install -m 600 /dev/null ~/.config/slack-self-mcp/app-token
-   # then paste xoxp-… into user-token and xapp-… into app-token
+   install -m 600 /dev/null ~/.config/slack-self-mcp/bot-token   # optional
+   # then paste xoxp-… into user-token, xapp-… into app-token and xoxb-… into bot-token
    ```
 
-   Set `SLACK_USER_TOKEN_FILE` or `SLACK_APP_TOKEN_FILE` to read a token
-   from a different path.
+   Set `SLACK_USER_TOKEN_FILE`, `SLACK_APP_TOKEN_FILE` or
+   `SLACK_BOT_TOKEN_FILE` to read a token from a different path.
 
 ### 4. Register the MCP server
 
@@ -365,8 +481,14 @@ The listener is split into two pieces:
 
 1. **Singleton daemon** — `scripts/slack-listen.mjs`. One per machine + user
    token. Owns the Slack Socket Mode connection, dedups echoes of our own
-   `slack_send` / `slack_edit` posts, and appends shaped+enriched events
-   to `events.jsonl`. Spawned automatically when the MCP server boots or
+   `slack_send` / `slack_edit` posts (as you or as the bot), drops a message
+   Slack delivers twice (once for the user and once for the bot
+   subscription), and appends shaped+enriched events to `events.jsonl`.
+   With a bot token it marks the bot's own posts `is_self: true`, so the
+   self filter treats them like yours. A post of ours that isn't in
+   `recent-sends.jsonl` yet is checked again 6 s later, because a file
+   send is recorded only after its ts is found in history; so self events
+   reach `--watch-self` consumers about 6 s late. Spawned automatically when the MCP server boots or
    when any per-agent stream binary boots — `ensureRunning()` is idempotent
    and race-safe (concurrent boots only produce one daemon).
 2. **Per-agent stream binary** — `scripts/slack-listen-stream.mjs`. One
@@ -553,24 +675,24 @@ This is opt-in — agents that want to identify themselves can; agents that
 don't, won't. If `SLACK_SEND_FOOTER` is empty, the signature is also
 suppressed (no footer at all).
 
-> Note: this MCP posts as the human user (xoxp- token), so Slack itself will
-> not show a "via app" badge. The footer is the substitute. If you'd rather
-> have a username/icon override, that requires the `chat:write.customize`
-> scope and a reinstall — and it still wouldn't apply to file uploads, which
-> is why we went with a text footer instead.
+> Note: posts made as the human user (xoxp- token) don't get Slack's APP
+> badge, so the footer is the substitute. Posts made as the bot (see
+> §Posting as a bot) already show the bot's name and the APP badge, so they
+> get no footer and `agent_signature` is ignored for them.
 
 ## Notes / gotchas
 
 - `files_upload_v2` requires channel **IDs**, not names — the resolver always
   produces an ID before calling it.
 - The token holder must be a member of the channel they're posting into.
-  For private channels, invite yourself first.
-- Resolutions are cached for the process lifetime. Restart the MCP server
-  after creating a new channel or DM you want to address by name.
-- This MCP intentionally does not duplicate the existing
-  `mcp__claude_ai_Slack__*` connector's reactions / search / history /
-  thread-read tools. Use those for everything except sending with files
-  and listening.
+  For private channels, invite yourself first, and invite the bot too if it
+  should post there as itself.
+- The channel and user lists behind name lookups are refetched every 10
+  minutes, and sooner when a name isn't found, so a new channel can be
+  addressed by name without restarting the server. A name that resolved
+  once keeps its ID for the server's lifetime.
+- This MCP has no reactions, canvases or drafts. Use the
+  `mcp__claude_ai_Slack__*` connector for those.
 
 ## Files
 
@@ -581,7 +703,8 @@ slack-self-mcp/
 ├── LICENSE
 ├── .env.example
 ├── src/
-│   ├── server.mjs               # MCP stdio server (slack_send / edit / history / mark_read / file_download / resolve / listen_instructions)
+│   ├── server.mjs               # MCP stdio server (slack_send / edit / history / mark_read / file_download / resolve / search / listen_instructions)
+│   ├── messages.mjs             # permalinks, search results, user profiles, post_at parsing
 │   ├── mark-read.mjs            # forward-only read-position marking for slack_mark_read
 │   ├── config.mjs               # loads tokens from env → repo .env → ~/.config/slack-self-mcp/
 │   ├── resolver.mjs             # target → channel ID + fuzzy candidates
@@ -596,5 +719,7 @@ slack-self-mcp/
     ├── recent-sends.test.mjs
     ├── listener-singleton.test.mjs
     ├── mark-read.test.mjs
+    ├── messages.test.mjs
+    ├── resolver.test.mjs
     └── slack-listen-stream.test.mjs    # run all: `npm test`
 ```

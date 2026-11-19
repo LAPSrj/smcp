@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // MCP server exposing the slack_* tools (see TOOLS) over stdio.
-// Uses the user OAuth token (xoxp-…) so messages are attributed to the human.
+// Reads with the user OAuth token (xoxp-…). Sends and edits go through the
+// optional bot token (xoxb-…) when it can post there, otherwise as the user.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,7 +18,8 @@ import {
 import { WebClient } from '@slack/web-api';
 
 import { loadConfig, missingTokenHelp } from './config.mjs';
-import { resolveTarget, resolveSendTarget, searchTargets, lookupUserName } from './resolver.mjs';
+import { resolveSendTarget, resolveUserId, searchTargets, lookupUserName } from './resolver.mjs';
+import { buildPermalink, parsePostAt, searchSlack, userInfo, SEARCH_MAX_LIMIT } from './messages.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
 import { STREAM_BINARY_PATH, buildMonitor, replyWatch } from './listen-command.mjs';
@@ -51,6 +53,75 @@ if (!USER_TOKEN.startsWith('xoxp-')) {
 
 const slack = new WebClient(USER_TOKEN);
 
+let workspaceUrlCache = null;
+async function workspaceUrl() {
+  workspaceUrlCache ??= (await slack.auth.test()).url;
+  return workspaceUrlCache;
+}
+
+// Optional bot token: sends and edits try it first and fall back to the user.
+const BOT_TOKEN = process.env.SLACK_BOT_TOKEN || '';
+let bot = null;
+if (BOT_TOKEN.startsWith('xoxb-')) {
+  bot = new WebClient(BOT_TOKEN);
+} else if (BOT_TOKEN) {
+  console.error(
+    `slack-self-mcp: SLACK_BOT_TOKEN does not start with "xoxb-", so every message is sent as the user. Got prefix: ${BOT_TOKEN.slice(0, 5)}…`,
+  );
+}
+// "@me" is the DM where agents reach the user: the one with the bot, which
+// notifies them, or their self-DM without a bot. In a group-DM list it is
+// the user, whom the resolver drops because Slack adds them anyway.
+const isMe = (t) => typeof t === 'string' && t.trim().toLowerCase() === '@me';
+let botUserIdCache = null;
+async function botUserId() {
+  botUserIdCache ??= (await bot.auth.test()).user_id;
+  return botUserIdCache;
+}
+
+let meIds = null;
+async function expandMe(target) {
+  const list = Array.isArray(target) ? target : [target];
+  if (!list.some(isMe)) return target;
+  if (!meIds) {
+    const self = (await slack.auth.test()).user_id;
+    let dm = self;
+    if (bot) {
+      try {
+        dm = await botUserId();
+      } catch (err) {
+        console.error(`slack-self-mcp: bot auth.test failed, @me falls back to the self-DM: ${formatSlackError(err)}`);
+      }
+    }
+    meIds = { self, dm };
+  }
+  if (list.length === 1) return meIds.dm;
+  return list.map((t) => (isMe(t) ? meIds.self : t));
+}
+
+// Conversations only the bot is in (people's DMs with it) are invisible to
+// the user token, so a channel ID the user can't resolve is tried as the bot.
+// Returns the resolution and the client that can read that conversation.
+async function resolveConversation(target) {
+  const expanded = await expandMe(target);
+  const resolution = await resolveSendTarget(slack, expanded);
+  const id = typeof expanded === 'string' ? expanded.trim() : '';
+  if (!resolution.error || !bot || !/^[CGD][A-Z0-9]{6,}$/.test(id)) return { resolution, reader: slack };
+  try {
+    const { channel: c } = await bot.conversations.info({ channel: id });
+    const type = c.is_im ? 'im' : c.is_mpim ? 'mpim' : c.is_private ? 'private_channel' : 'public_channel';
+    let display = c.name ? `#${c.name}` : c.id;
+    if (c.is_im && c.user) display = `bot DM with @${(await lookupUserName(slack, c.user))?.name ?? c.user}`;
+    return { resolution: { channel_id: c.id, type, display, bot_only: true }, reader: bot };
+  } catch {
+    return { resolution, reader: slack };
+  }
+}
+
+const BOT_IDENTITY = Object.fromEntries(
+  [['username', process.env.SLACK_BOT_USERNAME], ['icon_url', process.env.SLACK_BOT_ICON_URL]].filter(([, v]) => v),
+);
+
 // Hand off tokens to the listener via $XDG_RUNTIME_DIR/slack-self-mcp/tokens.env
 // (mode 0600, in user-private tmpfs). Monitor strips env from spawned children;
 // rather than push tokens into the listener's command line — visible in
@@ -67,6 +138,7 @@ function ensureRuntimeTokens() {
     return writeTokens({
       SLACK_USER_TOKEN: USER_TOKEN,
       SLACK_APP_TOKEN: process.env.SLACK_APP_TOKEN ?? '',
+      SLACK_BOT_TOKEN: bot ? BOT_TOKEN : '',
     });
   } catch (err) {
     console.error(`slack-self-mcp: could not write runtime tokens: ${err.message}`);
@@ -118,18 +190,32 @@ function withFooter(text, signature) {
   return `${text}\n${f}`;
 }
 
+const FORMAT_SCHEMA = {
+  type: 'string',
+  enum: ['mrkdwn', 'markdown'],
+  description: '"markdown" (default): standard Markdown, **bold**, ~~strike~~, [text](url), tables and headings. "mrkdwn": Slack syntax, *bold* and ~strike~. Mentions (<@U…>, <#C…>, <!here>) and <url|text> links work in both.',
+};
+
 const TOOLS = [
   {
     name: 'slack_send',
     description:
-      'Send a Slack message as the human user, optionally with file attachments. ' +
-      'target accepts a single reference (#channel-name, channel ID C…/G…, @handle, user ID U…, or email) ' +
+      'Send a Slack message, optionally with file attachments. ' +
+      'If a bot token is configured, it posts as the bot; where the bot cannot post (DMs between people, group DMs, private channels it is not in), ' +
+      'it posts as the human user instead, with the footer. The result\'s posted_as says which ("bot" or "user"), and bot_error says why the bot failed. ' +
+      'Set as to "bot" when the message must come from the bot (e.g. "DM X as the bot"): a person as the target then means the bot\'s own DM with them, ' +
+      'and nothing is sent as the human if the bot can\'t post. as "user" always posts as the human. ' +
+      'target accepts a single reference (#channel-name, channel ID C…/G…, @handle, user ID U…, email, or @me for the DM where you reach the human: ' +
+      'their DM with the bot, or their self-DM when no bot token is set) ' +
       'OR an array of 2-8 user references — in which case slack-self opens an MPIM (group DM) for that user set ' +
       'via conversations.open and posts to the resulting channel. Slack auto-includes the caller and dedupes, ' +
       'so opening the same MPIM repeatedly returns the same channel. ' +
       'On a unique single match, posts text via chat.postMessage; if file_paths is non-empty, ' +
       'it instead uploads all files via files_upload_v2 as ONE message with text as its comment. thread_ts applies either way. ' +
       'On ambiguous/unknown target, returns { error, candidates: [...] } — re-call with target_id from a candidate. ' +
+      'The result has the message permalink; give it to the human when you tell them you posted. ' +
+      'Text is standard Markdown by default (**bold**, [text](url), tables, headings); set format "mrkdwn" for Slack\'s own syntax (*bold*). ' +
+      'post_at schedules a text message instead of sending it now (no file_paths); it returns scheduled_message_id and no ts. ' +
       'If you expect a reply, start the Monitor in the result\'s reply_watch field right after sending; it delivers both top-level and thread replies in that conversation.',
     inputSchema: {
       type: 'object',
@@ -140,13 +226,20 @@ const TOOLS = [
             { type: 'array', items: { type: 'string' }, minItems: 1 },
           ],
           description:
-            'Single reference (#channel, channel ID, @handle, user ID, or email), OR an array of user references. ' +
+            'Single reference (#channel, channel ID, @handle, user ID, email, or @me), OR an array of user references. ' +
             'An array with 2-8 user references opens an MPIM (group DM) and posts there. ' +
             'A length-1 array is treated the same as the equivalent single string.',
         },
         text: {
           type: 'string',
           description: 'Message text. Optional if file_paths is non-empty (uploads will have no parent text).',
+        },
+        as: {
+          type: 'string',
+          enum: ['auto', 'bot', 'user'],
+          description:
+            'Who posts. "auto" (default): the bot where it can, else the human. "bot": only the bot, and a person as the target ' +
+            'means the bot\'s DM with them (the human can\'t see that DM; replies reach the bot). "user": only the human.',
         },
         file_paths: {
           type: 'array',
@@ -156,6 +249,21 @@ const TOOLS = [
         thread_ts: {
           type: 'string',
           description: 'Optional parent message ts to reply within a thread.',
+        },
+        format: FORMAT_SCHEMA,
+        reply_broadcast: {
+          type: 'boolean',
+          description: 'With thread_ts, also show the reply in the channel. Text messages only.',
+        },
+        unfurl: {
+          type: 'boolean',
+          description: 'true shows link and media previews, false hides them. Omit for Slack\'s default. Text messages only.',
+        },
+        post_at: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description:
+            'Schedule instead of sending now: Unix seconds, or an ISO 8601 time with its offset (e.g. "2026-11-19T09:00:00-08:00"). ' +
+            'Slack needs it in the future and at most 120 days out. Text messages only; a scheduled message is cancelled or edited in Slack\'s "Drafts & sent" view.',
         },
         agent_signature: {
           type: 'string',
@@ -172,7 +280,8 @@ const TOOLS = [
   {
     name: 'slack_edit',
     description:
-      'Edit a previously sent message via chat.update. With a user token this only works on messages the same user sent. ' +
+      'Edit a previously sent message via chat.update. Each token can only edit its own messages, so it tries the bot token first and then the user token; ' +
+      'edited_as in the result says which one worked. ' +
       'For threaded replies, ts is the reply\'s own ts (not the parent thread_ts). text fully replaces the previous text.',
     inputSchema: {
       type: 'object',
@@ -180,6 +289,7 @@ const TOOLS = [
         channel_id: { type: 'string', description: 'Channel ID returned by slack_send.' },
         ts: { type: 'string', description: 'Message ts returned by slack_send.' },
         text: { type: 'string', description: 'Replacement text.' },
+        format: FORMAT_SCHEMA,
         agent_signature: {
           type: 'string',
           description:
@@ -196,9 +306,10 @@ const TOOLS = [
       'Read recent messages in a channel/DM/MPIM, or the full reply set of a thread. ' +
       'target follows the same rules as slack_send: a single reference, or an array of 2-8 user references ' +
       '(resolved to the corresponding MPIM via conversations.open — idempotent, so this does not create a new conversation if it already exists). ' +
-      'Without thread_ts: conversations.history. With thread_ts: conversations.replies (parent first). ' +
-      'before_ts paginates backward (passed as the API "latest" cursor). ' +
-      'limit defaults to 20, capped at 100. Subtype-bearing messages (joins, edits, file shares) are returned — caller decides what is relevant.',
+      'Without thread_ts: conversations.history, newest first. With thread_ts: conversations.replies, oldest first (parent first). ' +
+      'before_ts and after_ts bound the time range; pass the result\'s next_cursor as cursor for the next page. ' +
+      'Each message has a permalink, and a thread parent has reply_count and latest_reply, so you can tell which messages have threads. ' +
+      'limit defaults to 20, capped at 100 for a channel and 1000 for a thread. Subtype-bearing messages (joins, edits, file shares) are returned — caller decides what is relevant.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -208,11 +319,13 @@ const TOOLS = [
             { type: 'array', items: { type: 'string' }, minItems: 1 },
           ],
           description:
-            'Single reference (#channel, channel ID, @handle, user ID, or email), OR an array of user references for an MPIM (group DM).',
+            'Single reference (#channel, channel ID, @handle, user ID, email, or @me), OR an array of user references for an MPIM (group DM).',
         },
-        limit: { type: 'number', description: 'Max messages. Default 20, capped at 100.' },
+        limit: { type: 'number', description: 'Max messages. Default 20, capped at 100 (1000 with thread_ts).' },
         thread_ts: { type: 'string', description: 'If set, fetch the full reply set via conversations.replies.' },
-        before_ts: { type: 'string', description: 'Paginate backward — passed to the API as "latest".' },
+        before_ts: { type: 'string', description: 'Only messages before this ts — passed to the API as "latest".' },
+        after_ts: { type: 'string', description: 'Only messages after this ts — passed to the API as "oldest". Use it to read what is new since a message.' },
+        cursor: { type: 'string', description: 'next_cursor from a previous result, for the next page.' },
       },
       required: ['target'],
     },
@@ -234,7 +347,7 @@ const TOOLS = [
             { type: 'string' },
             { type: 'array', items: { type: 'string' }, minItems: 1 },
           ],
-          description: 'Same as slack_history: #channel, channel ID, @handle, user ID, email, or an array of user references for an MPIM.',
+          description: 'Same as slack_history: #channel, channel ID, @handle, user ID, email, @me, or an array of user references for an MPIM.',
         },
         ts: { type: 'string', description: 'ts of the newest message to mark as read.' },
         thread_ts: { type: 'string', description: 'Parent ts when ts is a thread reply.' },
@@ -321,14 +434,39 @@ const TOOLS = [
   {
     name: 'slack_resolve',
     description:
-      'Look up channels/users matching a target string. Same engine as the slack_send fallback. ' +
-      'Useful for introspection before sending. Returns { matches: [{ target_id, type, display, name?, real_name?, email? }, …] }.',
+      'Look up channels and people matching a target string, by name, channel topic or purpose, or job title. ' +
+      'Returns { matches: [{ target_id, type, display, name?, real_name?, email?, title?, topic?, purpose?, num_members?, is_archived? }, …] }. ' +
+      'With profile: true and a target that names one person, it also returns profile: title, timezone and their local time now, ' +
+      'status, presence (active/away), email and phone. Here @me means the human user.',
     inputSchema: {
       type: 'object',
       properties: {
-        target: { type: 'string', description: '#channel, channel ID, @handle, user ID, email, or bare string.' },
+        target: { type: 'string', description: '#channel, channel ID, @handle, user ID, email, @me, a topic or title word, or bare string.' },
+        profile: { type: 'boolean', description: 'Also return the profile of the one person the target names.' },
       },
       required: ['target'],
+    },
+  },
+  {
+    name: 'slack_search',
+    description:
+      'Search messages or files in every conversation the human user can see (public and private channels, DMs, group DMs), with their user token. ' +
+      'query uses Slack search syntax: words and "exact phrases", plus modifiers such as in:#channel, in:@user, from:@user, from:<@U123>, ' +
+      'with:@user, has:link, has:file, has:pin, is:thread, before:YYYY-MM-DD, after:YYYY-MM-DD, on:YYYY-MM-DD, during:month. ' +
+      'Messages come back with channel_id, ts, thread_ts (for thread replies), user, text and permalink; read a whole thread with slack_history(target=channel_id, thread_ts). ' +
+      'With content "files": files with id, name, permalink and the channels they were shared in; download one with slack_file_download(file_id). ' +
+      'Keyword search only, so try synonyms or fewer words when nothing matches.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Slack search query, e.g. "deploy failed in:#dev-team after:2026-11-01".' },
+        content: { type: 'string', enum: ['messages', 'files'], description: 'What to search. Default "messages".' },
+        sort: { type: 'string', enum: ['score', 'timestamp'], description: '"score" (relevance, default) or "timestamp".' },
+        sort_dir: { type: 'string', enum: ['desc', 'asc'], description: 'Default "desc" (best or newest first).' },
+        limit: { type: 'number', description: `Results per page. Default 20, capped at ${SEARCH_MAX_LIMIT}.` },
+        page: { type: 'number', description: 'Page number, starting at 1. The result says how many pages there are.' },
+      },
+      required: ['query'],
     },
   },
 ];
@@ -350,6 +488,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === 'slack_listen_instructions') return handleListenInstructions(args);
     if (name === 'slack_file_download') return await handleFileDownload(args);
     if (name === 'slack_resolve') return await handleResolve(args);
+    if (name === 'slack_search') return await handleSearch(args);
     return errorResult(`unknown tool: ${name}`);
   } catch (err) {
     return errorResult(formatSlackError(err));
@@ -384,12 +523,34 @@ function formatSlackError(err) {
   return parts.length ? parts.join(' | ') : String(err);
 }
 
+function checkFormat(format) {
+  return format === undefined || format === 'mrkdwn' || format === 'markdown'
+    ? null
+    : `format must be "mrkdwn" or "markdown" (got ${JSON.stringify(format)})`;
+}
+
 async function handleSend(args) {
-  const { target, text, file_paths, thread_ts, agent_signature } = args;
+  const { target, text, file_paths, thread_ts, agent_signature, as = 'auto', format, reply_broadcast, unfurl, post_at } = args;
   if (!isValidTarget(target)) {
     return errorResult('target is required (string or non-empty array of strings)');
   }
+  if (!['auto', 'bot', 'user'].includes(as)) return errorResult(`as must be "auto", "bot" or "user" (got ${JSON.stringify(as)})`);
+  if (as === 'bot' && !bot) return errorResult('as "bot" needs a bot token (SLACK_BOT_TOKEN), and none is set');
+  const formatError = checkFormat(format);
+  if (formatError) return errorResult(formatError);
   const files = Array.isArray(file_paths) ? file_paths : [];
+  if (reply_broadcast && !thread_ts) return errorResult('reply_broadcast needs thread_ts');
+  if (files.length > 0 && (reply_broadcast || unfurl !== undefined || post_at !== undefined)) {
+    return errorResult('reply_broadcast, unfurl and post_at work on text messages only, not with file_paths');
+  }
+  let postAt;
+  if (post_at !== undefined) {
+    postAt = parsePostAt(post_at);
+    if (postAt === null) {
+      return errorResult(`post_at must be Unix seconds or an ISO 8601 time with an offset, e.g. "2026-11-19T09:00:00-08:00" (got ${JSON.stringify(post_at)})`);
+    }
+  }
+  const options = { markdown: format !== 'mrkdwn', thread_ts, reply_broadcast, unfurl, postAt };
 
   for (const p of files) {
     if (typeof p !== 'string' || p.length === 0) return errorResult(`file_paths entry is not a string: ${JSON.stringify(p)}`);
@@ -402,71 +563,100 @@ async function handleSend(args) {
     return errorResult('either text or file_paths must be provided');
   }
 
-  const resolution = await resolveSendTarget(slack, target);
+  const { resolution } = await resolveConversation(target);
   if (resolution.error) {
     return ok(resolution);
   }
-  const channel_id = resolution.channel_id;
+  let channel_id = resolution.channel_id;
+  let display = resolution.display;
 
-  // Strategy:
-  //   files.length > 0  → files.uploadV2 with initial_comment=text. All files
-  //                        attach to ONE message (the upload's share message).
-  //                        thread_ts respected if set.
-  //   files.length == 0 → chat.postMessage.
-  //
-  // ts: chat.postMessage returns it directly. files.uploadV2 does not, so we
-  // recover it via files.info on the first uploaded file (shares lookup).
-  let ts = null;
-  let file_ids;
-
-  if (files.length > 0) {
-    const uploadParams = {
-      channel_id,
-      file_uploads: files.map((p) => ({
-        file: fs.createReadStream(p),
-        filename: path.basename(p),
-      })),
-    };
-    if (text && text.length > 0) uploadParams.initial_comment = withFooter(text, agent_signature);
-    if (thread_ts) uploadParams.thread_ts = thread_ts;
-
-    const uploadRes = await slack.files.uploadV2(uploadParams);
-    file_ids = extractFileIds(uploadRes);
-    ts = await resolveShareTs(file_ids[0], channel_id);
-  } else {
-    const params = { channel: channel_id, text: withFooter(text, agent_signature) };
-    if (thread_ts) params.thread_ts = thread_ts;
-    const msg = await slack.chat.postMessage(params);
-    ts = msg.ts ?? null;
+  // A person as the target resolves to the user's own DM with them, which the
+  // bot isn't in, so "as bot" goes to the bot's DM with that person instead.
+  const dmUser = resolution.type === 'user' ? resolution.user_id ?? resolution.user_ids?.[0] : null;
+  if (as === 'bot' && dmUser && dmUser !== (await botUserId())) {
+    try {
+      channel_id = (await bot.conversations.open({ users: dmUser })).channel.id;
+      display = `bot DM with ${resolution.display}`;
+    } catch (err) {
+      return errorResult(`could not open the bot's DM with ${resolution.display}: ${formatSlackError(err)}`);
+    }
   }
 
-  if (ts) recordSend({ ts, channel: channel_id });
+  // The bot can't post where it isn't a member (other people's DMs, group
+  // DMs, private channels it wasn't invited to), so with as "auto" any bot
+  // failure retries as the user. The bot's own name and APP badge replace
+  // the footer.
+  let sent = null;
+  let bot_error;
+  if (bot && as !== 'user') {
+    try {
+      sent = { ...(await post(bot, { channel_id, text, files, identity: BOT_IDENTITY, ...options })), posted_as: 'bot' };
+    } catch (err) {
+      if (as === 'bot') return errorResult(formatSlackError(err), { channel_id, resolved_target: { type: resolution.type, display } });
+      bot_error = formatSlackError(err);
+    }
+  }
+  if (!sent) {
+    sent = { ...(await post(slack, { channel_id, text: withFooter(text, agent_signature), files, ...options })), posted_as: 'user' };
+  }
+  const resolved_target = { type: resolution.type, display };
+
+  if (sent.scheduled_message_id) {
+    return ok({
+      channel_id,
+      scheduled_message_id: sent.scheduled_message_id,
+      post_at: new Date(sent.post_at * 1000).toISOString(),
+      scheduled_as: sent.posted_as,
+      ...(bot_error && { bot_error }),
+      resolved_target,
+    });
+  }
+
+  if (sent.ts) recordSend({ ts: sent.ts, channel: channel_id });
 
   return ok({
     channel_id,
-    ts,
-    file_ids,
-    resolved_target: { type: resolution.type, display: resolution.display },
+    ts: sent.ts,
+    permalink: sent.ts ? buildPermalink(await workspaceUrl(), channel_id, sent.ts, thread_ts) : null,
+    file_ids: sent.file_ids,
+    posted_as: sent.posted_as,
+    ...(bot_error && { bot_error }),
+    resolved_target,
     reply_watch: replyWatch(channel_id),
   });
 }
 
-async function resolveShareTs(fileId, channelId) {
-  if (!fileId) return null;
-  // files.info shares can lag right after completeUploadExternal returns
-  // (race), and the shape differs across channel kinds. Scanning the channel's
-  // recent history for the file id is more reliable — the file is always part
-  // of the share message we just posted.
-  try {
-    const res = await slack.conversations.history({ channel: channelId, limit: 10 });
-    for (const m of res.messages ?? []) {
-      const files = m.files ?? [];
-      if (files.some((f) => f?.id === fileId)) return m.ts ?? null;
+// markdown_text can't be combined with text (Slack: markdown_text_conflict).
+function messageContent(text, markdown) {
+  return markdown ? { markdown_text: text } : { text };
+}
+
+// Files go as ONE message (files.uploadV2) with text as its comment, and
+// uploadV2 doesn't return the share ts, so it is recovered from history.
+// Slack ignores username/icon_url on file shares, so identity is text-only.
+async function post(client, { channel_id, text, files, identity = {}, markdown, thread_ts, reply_broadcast, unfurl, postAt }) {
+  if (files.length === 0) {
+    const params = { channel: channel_id, ...messageContent(text, markdown) };
+    if (thread_ts) params.thread_ts = thread_ts;
+    if (reply_broadcast) params.reply_broadcast = true;
+    if (typeof unfurl === 'boolean') Object.assign(params, { unfurl_links: unfurl, unfurl_media: unfurl });
+    if (postAt !== undefined) {
+      const res = await client.chat.scheduleMessage({ ...params, post_at: postAt });
+      return { scheduled_message_id: res.scheduled_message_id, post_at: res.post_at ?? postAt };
     }
-    return null;
-  } catch {
-    return null;
+    const msg = await client.chat.postMessage({ ...params, ...identity });
+    return { ts: msg.ts ?? null };
   }
+  const uploadParams = {
+    channel_id,
+    file_uploads: files.map((p) => ({ file: fs.createReadStream(p), filename: path.basename(p) })),
+  };
+  if (text && markdown) uploadParams.blocks = [{ type: 'markdown', text }];
+  else if (text) uploadParams.initial_comment = text;
+  if (thread_ts) uploadParams.thread_ts = thread_ts;
+  const startedAt = Date.now() / 1000;
+  const file_ids = extractFileIds(await client.files.uploadV2(uploadParams));
+  return { ts: await resolveShareTs(client, file_ids[0], channel_id, thread_ts, startedAt), file_ids };
 }
 
 function extractFileIds(uploadRes) {
@@ -485,53 +675,96 @@ function extractFileIds(uploadRes) {
   return ids;
 }
 
+async function resolveShareTs(client, fileId, channelId, threadTs, startedAt) {
+  if (!fileId) return null;
+  // files.info shares can lag right after completeUploadExternal returns
+  // (race), and the shape differs across channel kinds. Scanning the channel's
+  // recent history for the file id is more reliable — the file is always part
+  // of the share message we just posted. The share message itself can also
+  // take a moment to appear in history, so this retries for about 3 s.
+  // A thread reply isn't in conversations.history, so a threaded upload is
+  // looked up among the thread's replies posted since the upload started.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 500));
+    try {
+      const res = threadTs
+        ? await client.conversations.replies({ channel: channelId, ts: threadTs, oldest: String(startedAt - 60), limit: 50 })
+        : await client.conversations.history({ channel: channelId, limit: 10 });
+      for (const m of res.messages ?? []) {
+        const files = m.files ?? [];
+        if (files.some((f) => f?.id === fileId)) return m.ts ?? null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// Each token can only edit its own messages, so a bot failure retries as
+// the user, the same way slack_send does.
 async function handleEdit(args) {
-  const { channel_id, ts, text, agent_signature } = args;
+  const { channel_id, ts, text, agent_signature, format } = args;
   if (!channel_id || !ts || typeof text !== 'string') {
     return errorResult('channel_id, ts, and text are all required');
   }
-  const res = await slack.chat.update({ channel: channel_id, ts, text: withFooter(text, agent_signature) });
+  const formatError = checkFormat(format);
+  if (formatError) return errorResult(formatError);
+  const markdown = format !== 'mrkdwn';
+  let res = null;
+  let edited_as = 'bot';
+  let bot_error;
+  if (bot) {
+    try {
+      res = await bot.chat.update({ channel: channel_id, ts, ...messageContent(text, markdown) });
+    } catch (err) {
+      bot_error = formatSlackError(err);
+    }
+  }
+  if (!res) {
+    edited_as = 'user';
+    try {
+      res = await slack.chat.update({ channel: channel_id, ts, ...messageContent(withFooter(text, agent_signature), markdown) });
+    } catch (err) {
+      return errorResult(formatSlackError(err), bot_error ? { bot_error } : undefined);
+    }
+  }
   if (res.ts && res.channel) recordSend({ ts: res.ts, channel: res.channel });
-  return ok({ channel_id: res.channel, ts: res.ts });
+  return ok({ channel_id: res.channel, ts: res.ts, edited_as });
 }
 
 async function handleHistory(args) {
-  const { target, limit, thread_ts, before_ts } = args;
+  const { target, limit, thread_ts, before_ts, after_ts, cursor } = args;
   if (!isValidTarget(target)) {
     return errorResult('target is required (string or non-empty array of strings)');
   }
-  const cap = 100;
+  const cap = thread_ts ? 1000 : 100;
   const fallback = 20;
   let n = typeof limit === 'number' && Number.isFinite(limit) ? Math.floor(limit) : fallback;
   if (n < 1) n = 1;
   if (n > cap) n = cap;
 
-  const resolution = await resolveSendTarget(slack, target);
+  const { resolution, reader } = await resolveConversation(target);
   if (resolution.error) return ok(resolution);
   const channel_id = resolution.channel_id;
 
-  let raw;
-  let has_more = false;
-  if (thread_ts) {
-    const params = { channel: channel_id, ts: thread_ts, limit: n };
-    if (before_ts) params.latest = before_ts;
-    const res = await slack.conversations.replies(params);
-    raw = res.messages ?? [];
-    has_more = !!res.has_more;
-  } else {
-    const params = { channel: channel_id, limit: n };
-    if (before_ts) params.latest = before_ts;
-    const res = await slack.conversations.history(params);
-    raw = res.messages ?? [];
-    has_more = !!res.has_more;
-  }
+  const params = { channel: channel_id, limit: n };
+  if (before_ts) params.latest = before_ts;
+  if (after_ts) params.oldest = after_ts;
+  if (cursor) params.cursor = cursor;
+  const res = thread_ts
+    ? await reader.conversations.replies({ ...params, ts: thread_ts })
+    : await reader.conversations.history(params);
+  const raw = res.messages ?? [];
 
-  const messages = await Promise.all(raw.map((m) => shapeMessage(m)));
+  const base = await workspaceUrl();
+  const messages = await Promise.all(raw.map((m) => shapeMessage(m, channel_id, base)));
   return ok({
     channel_id,
     resolved_target: { type: resolution.type, display: resolution.display },
     messages,
-    has_more,
+    has_more: !!res.has_more,
+    next_cursor: res.response_metadata?.next_cursor || null,
   });
 }
 
@@ -545,7 +778,7 @@ async function handleMarkRead(args) {
     return errorResult(`thread_ts must be a Slack timestamp (got ${JSON.stringify(thread_ts)})`);
   }
 
-  const resolution = await resolveSendTarget(slack, target);
+  const resolution = await resolveSendTarget(slack, await expandMe(target));
   if (resolution.error) return ok(resolution);
   const channel_id = resolution.channel_id;
 
@@ -553,15 +786,21 @@ async function handleMarkRead(args) {
   return ok({ channel_id, resolved_target: { type: resolution.type, display: resolution.display }, ...result });
 }
 
-async function shapeMessage(m) {
+async function shapeMessage(m, channel_id, base) {
   const user = m.user ? await lookupUserName(slack, m.user) : null;
   const out = {
     ts: m.ts ?? null,
     user: m.user ?? null,
     user_name: user?.name ?? user?.real_name ?? null,
     text: m.text ?? '',
+    permalink: m.ts ? buildPermalink(base, channel_id, m.ts, m.thread_ts) : null,
   };
   if (m.thread_ts) out.thread_ts = m.thread_ts;
+  if (m.reply_count) {
+    out.reply_count = m.reply_count;
+    out.reply_users_count = m.reply_users_count ?? null;
+    out.latest_reply = m.latest_reply ?? null;
+  }
   if (m.subtype) out.subtype = m.subtype;
   if (m.bot_id) out.bot_id = m.bot_id;
   if (m.edited) out.edited = { user: m.edited.user ?? null, ts: m.edited.ts ?? null };
@@ -620,7 +859,7 @@ async function handleListenInstructions(args = {}) {
     recent_sends_ttl_ms: DEFAULT_TTL_MS,
     notes: [
       'Architecture: one singleton listener daemon per machine owns the Slack Socket Mode connection and writes shaped events to events.jsonl. The Monitor command runs a per-agent stream binary that tails+filters that file. Each agent gets its own filtered stdout; the singleton is shared.',
-      'Echoes of this user-token\'s own slack_send / slack_edit posts are deduped at the singleton before they reach events.jsonl (TTL 5 min, match on (channel, ts)). You never see your own posts come back regardless of watch_self.',
+      'Echoes of our own slack_send / slack_edit posts (as the user or as the bot) are deduped at the singleton before they reach events.jsonl (TTL 5 min, match on (channel, ts)). You never see your own posts come back regardless of watch_self. Other posts by the bot count as is_self, like the user\'s.',
       'watch_self:true surfaces events authored by the token-holder (the human, when typing in Slack client on a channel/MPIM the Slack platform delivers events for). Note: self-typed DMs are platform-quirky in user-token Socket Mode — Slack may not deliver them depending on channel kind. The flag controls our filtering; it does not change what Slack delivers.',
       'include_subtypes:true surfaces edits, joins, file_share, bot_message, etc. Default drops them.',
       'channel / thread are server-side filtered by the per-agent binary, so unrelated events never reach your stdout. Use thread to follow a single conversation.',
@@ -720,15 +959,31 @@ async function handleFileDownload(args) {
 }
 
 async function handleResolve(args) {
-  const { target } = args;
+  const { target, profile } = args;
   if (typeof target !== 'string' || target.length === 0) {
     return errorResult('target is required');
   }
-  const result = await searchTargets(slack, target);
+  if (profile) {
+    const r = await resolveUserId(slack, target);
+    if (r.error) return ok(r);
+    return ok({ profile: await userInfo(slack, r.user_id) });
+  }
+  const result = await searchTargets(slack, await expandMe(target));
   return ok(result);
+}
+
+async function handleSearch(args) {
+  const { query, content = 'messages', sort = 'score', sort_dir = 'desc', limit, page } = args;
+  if (typeof query !== 'string' || !query.trim()) return errorResult('query is required');
+  if (!['messages', 'files'].includes(content)) return errorResult(`content must be "messages" or "files" (got ${JSON.stringify(content)})`);
+  if (!['score', 'timestamp'].includes(sort)) return errorResult(`sort must be "score" or "timestamp" (got ${JSON.stringify(sort)})`);
+  if (!['desc', 'asc'].includes(sort_dir)) return errorResult(`sort_dir must be "desc" or "asc" (got ${JSON.stringify(sort_dir)})`);
+  const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), SEARCH_MAX_LIMIT) : 20;
+  const p = typeof page === 'number' && Number.isFinite(page) ? Math.max(Math.floor(page), 1) : 1;
+  return ok(await searchSlack(slack, { query: query.trim(), content, sort, sort_dir, limit: n, page: p }));
 }
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
 // stderr ok; stdout is reserved for MCP framing.
-console.error('slack-self-mcp: ready (user-token mode)');
+console.error(`slack-self-mcp: ready (${bot ? 'bot first, user fallback' : 'user-token mode'})`);

@@ -9,14 +9,19 @@
 // Returns either { channel_id, type, display, ... } on a unique match,
 // or { error: 'no_match' | 'ambiguous', input, candidates: [...], hint, more_available? }.
 //
-// All directory lookups are cached for the process lifetime. Channel/user
-// lists are fetched lazily and refreshed only on explicit cache-bust (not
-// implemented — long-lived MCP servers should be restarted to re-sync).
+// Channel and user lists are refetched after LIST_TTL_MS, and sooner when a
+// name finds nothing (a channel created since the last fetch). Resolved
+// targets, DM IDs and per-user names are cached for the process lifetime.
+
+const LIST_TTL_MS = 10 * 60_000;
+const REFETCH_ON_MISS_AFTER_MS = 30_000;
 
 const CACHE = {
   resolved: new Map(),    // input → { channel_id, type, ... }
-  channels: null,         // [{ id, name, is_private, is_im, is_mpim }]
-  users: null,            // [{ id, name, real_name, display_name, email, deleted, is_bot }]
+  channels: null,         // [{ id, name, is_private, is_im, is_mpim, is_archived, topic, purpose, num_members }]
+  channelsAt: 0,
+  users: null,            // [{ id, name, real_name, display_name, email, title, is_bot }]
+  usersAt: 0,
   dms: new Map(),         // user_id → channel_id
   userById: new Map(),    // user_id → { name, real_name, display_name, email }
   selfUserId: null,       // string — cached auth.test().user_id
@@ -66,14 +71,16 @@ function clearCachedResolution(input) {
   CACHE.resolved.delete(input);
 }
 
-async function listAllChannels(client) {
-  if (CACHE.channels) return CACHE.channels;
+const isFresh = (at, maxAge) => Date.now() - at < maxAge;
+
+async function listAllChannels(client, { maxAge = LIST_TTL_MS } = {}) {
+  if (CACHE.channels && isFresh(CACHE.channelsAt, maxAge)) return CACHE.channels;
   const out = [];
   let cursor;
   do {
     const res = await client.conversations.list({
       types: 'public_channel,private_channel,mpim,im',
-      exclude_archived: true,
+      exclude_archived: false,
       limit: 1000,
       cursor,
     });
@@ -84,17 +91,22 @@ async function listAllChannels(client) {
         is_private: !!c.is_private,
         is_im: !!c.is_im,
         is_mpim: !!c.is_mpim,
+        is_archived: !!c.is_archived,
         user: c.user ?? null,
+        topic: c.topic?.value || null,
+        purpose: c.purpose?.value || null,
+        num_members: c.num_members ?? null,
       });
     }
     cursor = res.response_metadata?.next_cursor || undefined;
   } while (cursor);
   CACHE.channels = out;
+  CACHE.channelsAt = Date.now();
   return out;
 }
 
-async function listAllUsers(client) {
-  if (CACHE.users) return CACHE.users;
+async function listAllUsers(client, { maxAge = LIST_TTL_MS } = {}) {
+  if (CACHE.users && isFresh(CACHE.usersAt, maxAge)) return CACHE.users;
   const out = [];
   let cursor;
   do {
@@ -107,13 +119,27 @@ async function listAllUsers(client) {
         real_name: u.real_name ?? u.profile?.real_name ?? null,
         display_name: u.profile?.display_name || u.profile?.display_name_normalized || null,
         email: u.profile?.email ?? null,
+        title: u.profile?.title || null,
         is_bot: !!u.is_bot,
       });
     }
     cursor = res.response_metadata?.next_cursor || undefined;
   } while (cursor);
   CACHE.users = out;
+  CACHE.usersAt = Date.now();
   return out;
+}
+
+// Runs search(channels, users); when it finds nothing, refetches lists older
+// than REFETCH_ON_MISS_AFTER_MS once and searches again.
+async function searchLists(client, { channels: wantChannels, users: wantUsers }, search) {
+  const load = (maxAge) => Promise.all([
+    wantChannels ? listAllChannels(client, { maxAge }) : [],
+    wantUsers ? listAllUsers(client, { maxAge }) : [],
+  ]);
+  const hits = search(...(await load(LIST_TTL_MS)));
+  if (hits.length > 0) return hits;
+  return search(...(await load(REFETCH_ON_MISS_AFTER_MS)));
 }
 
 async function openDm(client, userId) {
@@ -144,35 +170,46 @@ function bestScore(needle, fields) {
   return best;
 }
 
-function searchChannels(channels, needle) {
+// A match only in a topic, purpose or title ranks after every name match.
+const DESCRIPTION_SCORE = 3;
+
+// extended: also match topic/purpose and report them and archived channels
+// (slack_resolve). Without it, archived channels are skipped, since nothing
+// can be posted there.
+function searchChannels(channels, needle, { extended = false } = {}) {
   const stripped = needle.startsWith('#') ? needle.slice(1) : needle;
   const results = [];
   for (const c of channels) {
     if (c.is_im || c.is_mpim) continue;
     if (!c.name) continue;
-    const s = scoreMatch(stripped, c.name);
+    if (c.is_archived && !extended) continue;
+    let s = scoreMatch(stripped, c.name);
+    if (s === null && extended && bestScore(stripped, [c.topic, c.purpose]) !== null) s = DESCRIPTION_SCORE;
     if (s !== null) {
-      results.push({
+      const hit = {
         score: s,
         target_id: c.id,
         type: c.is_private ? 'private_channel' : 'public_channel',
         display: `#${c.name}`,
         name: c.name,
-      });
+      };
+      if (extended) Object.assign(hit, { topic: c.topic, purpose: c.purpose, num_members: c.num_members, is_archived: c.is_archived });
+      results.push(hit);
     }
   }
-  results.sort((a, b) => a.score - b.score);
+  results.sort((a, b) => a.score - b.score || (a.is_archived ? 1 : 0) - (b.is_archived ? 1 : 0));
   return results;
 }
 
-function searchUsers(users, needle) {
+function searchUsers(users, needle, { extended = false } = {}) {
   const stripped = needle.startsWith('@') ? needle.slice(1) : needle;
   const results = [];
   for (const u of users) {
     if (u.is_bot) continue; // sends-as-user; bot DMs are noisy
-    const s = bestScore(stripped, [u.name, u.display_name, u.real_name, u.email]);
+    let s = bestScore(stripped, [u.name, u.display_name, u.real_name, u.email]);
+    if (s === null && extended && scoreMatch(stripped, u.title) !== null) s = DESCRIPTION_SCORE;
     if (s !== null) {
-      results.push({
+      const hit = {
         score: s,
         target_id: u.id,
         type: 'user',
@@ -180,7 +217,9 @@ function searchUsers(users, needle) {
         name: u.name,
         real_name: u.real_name,
         email: u.email,
-      });
+      };
+      if (extended) hit.title = u.title;
+      results.push(hit);
     }
   }
   results.sort((a, b) => a.score - b.score);
@@ -297,8 +336,7 @@ export async function resolveTarget(client, rawInput) {
 
   // 4. #channel-name — search channels only.
   if (input.startsWith('#')) {
-    const channels = await listAllChannels(client);
-    const hits = searchChannels(channels, input);
+    const hits = await searchLists(client, { channels: true }, (channels) => searchChannels(channels, input));
     if (hits.length === 1 && hits[0].score === 0) {
       const channel_id = hits[0].target_id;
       const result = { channel_id, type: hits[0].type, display: hits[0].display, name: hits[0].name };
@@ -317,18 +355,16 @@ export async function resolveTarget(client, rawInput) {
 
   // 5. @handle — search users only.
   if (input.startsWith('@')) {
-    const users = await listAllUsers(client);
-    const hits = searchUsers(users, input);
+    const hits = await searchLists(client, { users: true }, (_, users) => searchUsers(users, input));
     return await finalizeUserSearch(client, input, hits);
   }
 
   // 6. Bare string — search channels + users.
-  const [channels, users] = await Promise.all([listAllChannels(client), listAllUsers(client)]);
-  const channelHits = searchChannels(channels, input);
-  const userHits = searchUsers(users, input);
+  const merged = await searchLists(client, { channels: true, users: true }, (channels, users) =>
+    [...searchChannels(channels, input), ...searchUsers(users, input)].sort((a, b) => a.score - b.score));
 
   // Exact unique hit shortcut.
-  const exact = [...channelHits, ...userHits].filter((h) => h.score === 0);
+  const exact = merged.filter((h) => h.score === 0);
   if (exact.length === 1) {
     const hit = exact[0];
     if (hit.type === 'user') {
@@ -342,7 +378,6 @@ export async function resolveTarget(client, rawInput) {
     return result;
   }
 
-  const merged = [...channelHits, ...userHits].sort((a, b) => a.score - b.score);
   const { candidates, more_available } = cap(merged);
   return {
     error: merged.length === 0 ? 'no_match' : 'ambiguous',
@@ -423,17 +458,50 @@ export async function searchTargets(client, rawInput) {
     }
   }
 
+  const opts = { extended: true };
   let hits;
   if (input.startsWith('#')) {
-    hits = searchChannels(await listAllChannels(client), input);
+    hits = await searchLists(client, { channels: true }, (channels) => searchChannels(channels, input, opts));
   } else if (input.startsWith('@')) {
-    hits = searchUsers(await listAllUsers(client), input);
+    hits = await searchLists(client, { users: true }, (_, users) => searchUsers(users, input, opts));
   } else {
-    const [channels, users] = await Promise.all([listAllChannels(client), listAllUsers(client)]);
-    hits = [...searchChannels(channels, input), ...searchUsers(users, input)].sort((a, b) => a.score - b.score);
+    hits = await searchLists(client, { channels: true, users: true }, (channels, users) =>
+      [...searchChannels(channels, input, opts), ...searchUsers(users, input, opts)].sort((a, b) => a.score - b.score));
   }
   const { candidates, more_available } = cap(hits);
   return { matches: stripCandidateScores(candidates), more_available };
+}
+
+// Public: a user reference (@me, @handle, U…/W…, email, name) to a user ID,
+// without opening a DM. Returns { user_id } or { error, input, candidates, hint }.
+export async function resolveUserId(client, rawInput) {
+  const input = typeof rawInput === 'string' ? rawInput.trim() : '';
+  if (!input) return { error: 'no_match', input, candidates: [], hint: 'user must be a non-empty string' };
+  if (input.toLowerCase() === '@me') return { user_id: await getSelfUserId(client) };
+  if (USER_ID_RE.test(input)) return { user_id: input };
+  if (CHANNEL_ID_RE.test(input) || input.startsWith('#')) {
+    return { error: 'not_a_user', input, candidates: [], hint: `"${input}" is a channel; pass a person` };
+  }
+  if (looksLikeEmail(input)) {
+    try {
+      const res = await client.users.lookupByEmail({ email: input });
+      if (res.user?.id) return { user_id: res.user.id };
+    } catch (err) {
+      if (err.data?.error !== 'users_not_found') throw err;
+    }
+  }
+  const hits = await searchLists(client, { users: true }, (_, users) => searchUsers(users, input));
+  if (hits.length === 1 || (hits.length > 1 && hits[0].score === 0 && hits[1].score !== 0)) {
+    return { user_id: hits[0].target_id };
+  }
+  const { candidates, more_available } = cap(hits);
+  return {
+    error: hits.length === 0 ? 'no_match' : 'ambiguous',
+    input,
+    candidates: stripCandidateScores(candidates),
+    more_available,
+    hint: 're-call with user set to one of the target_id values',
+  };
 }
 
 // Public: resolve a list of user-ish inputs to an MPIM channel (or 1:1 IM if

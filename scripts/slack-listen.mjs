@@ -20,6 +20,7 @@
 // Env:
 //   SLACK_USER_TOKEN  — xoxp-… for user/channel name resolution + auth.test
 //   SLACK_APP_TOKEN   — xapp-… for the socket connection
+//   SLACK_BOT_TOKEN   — optional xoxb-…, only to recognize the bot's own posts
 //
 // Tokens are read from process.env, the repo .env, ~/.config/slack-self-mcp/,
 // then from $XDG_RUNTIME_DIR/.../tokens.env as a fallback (Monitor strips env
@@ -46,6 +47,7 @@ import {
 } from '../src/listener-singleton.mjs';
 
 const EVENTS_ROTATE_BYTES = 5 * 1024 * 1024; // 5 MB
+const ECHO_RECHECK_MS = 6000;
 
 for (const [key, source] of Object.entries(loadConfig())) {
   if (source !== 'env') console.error(`slack-listen: ${key} loaded from ${source}`);
@@ -53,14 +55,16 @@ for (const [key, source] of Object.entries(loadConfig())) {
 
 let USER_TOKEN = process.env.SLACK_USER_TOKEN;
 let APP_TOKEN = process.env.SLACK_APP_TOKEN;
+let BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 const INCLUDE_SUBTYPES_DEFAULT = process.env.SLACK_LISTEN_INCLUDE_SUBTYPES === '1';
 
-if (!USER_TOKEN || !APP_TOKEN) {
+if (!USER_TOKEN || !APP_TOKEN || !BOT_TOKEN) {
   try {
     const fileTokens = readTokens();
     if (fileTokens) {
       if (!USER_TOKEN && fileTokens.SLACK_USER_TOKEN) USER_TOKEN = fileTokens.SLACK_USER_TOKEN;
       if (!APP_TOKEN && fileTokens.SLACK_APP_TOKEN) APP_TOKEN = fileTokens.SLACK_APP_TOKEN;
+      if (!BOT_TOKEN && fileTokens.SLACK_BOT_TOKEN) BOT_TOKEN = fileTokens.SLACK_BOT_TOKEN;
       if (USER_TOKEN || APP_TOKEN) {
         console.error(`slack-listen: loaded tokens from runtime file ${runtimeTokensPath()}`);
       }
@@ -97,7 +101,28 @@ const userCache = new Map();   // user_id → { name, real_name }
 const channelCache = new Map(); // channel_id → { name, is_im, is_mpim, is_private }
 
 let selfUserId = null;
+let botUserId = null;
+let botId = null;
 let heartbeatTimer = null;
+
+// Posts from the bot count as ours, the same as posts from the user.
+function isOwnAuthor(event) {
+  if (event.user && (event.user === selfUserId || event.user === botUserId)) return true;
+  return !!botId && event.bot_id === botId;
+}
+
+// With both user and bot event subscriptions, a message in a conversation
+// both are in can arrive twice. Set keeps insertion order, so the oldest key
+// is dropped first.
+const SEEN_MAX = 1000;
+const seenEvents = new Set();
+function isRepeatDelivery(event) {
+  const key = `${event.channel}:${event.ts}:${event.subtype ?? ''}`;
+  if (seenEvents.has(key)) return true;
+  seenEvents.add(key);
+  if (seenEvents.size > SEEN_MAX) seenEvents.delete(seenEvents.values().next().value);
+  return false;
+}
 
 async function lookupUser(userId) {
   if (!userId) return null;
@@ -202,7 +227,7 @@ async function shape(event) {
     user: event.user ?? null,
     user_name: user?.name ?? null,
     user_real_name: user?.real_name ?? null,
-    is_self: !!event.user && event.user === selfUserId,
+    is_self: isOwnAuthor(event),
     text: event.text ?? '',
     thread_ts: event.thread_ts ?? null,
     subtype: event.subtype ?? null,
@@ -215,13 +240,18 @@ async function shape(event) {
 // (watch-self / channel / thread / include-subtypes) happen downstream
 // in the stream binary; the singleton emits everything that's not a
 // definite self-echo of our own send.
-function shouldDrop(event) {
+async function shouldDrop(event) {
   if (!event) return true;
   if (event.type !== 'message') return true;
-  // Drop our own slack_send echoes. This is the ONLY hard drop; all other
-  // events flow to events.jsonl so per-agent stream binaries can decide.
-  if (event.user && event.user === selfUserId && isOwnSendEcho(event)) return true;
-  return false;
+  if (isRepeatDelivery(event)) return true;
+  // Drop our own slack_send echoes; all other events flow to events.jsonl
+  // so per-agent stream binaries can decide.
+  if (!isOwnAuthor(event)) return false;
+  if (isOwnSendEcho(event)) return true;
+  // slack_send records a file post only after finding its ts in history,
+  // which can finish after the event arrives, so check once more later.
+  await new Promise((r) => setTimeout(r, ECHO_RECHECK_MS));
+  return isOwnSendEcho(event);
 }
 
 // @slack/socket-mode v2.x: the 'slack_event' handler receives the envelope
@@ -237,7 +267,7 @@ socket.on('slack_event', async ({ ack, type, body }) => {
   if (type !== 'events_api') return;
   const event = body?.event;
   if (!event) return;
-  if (shouldDrop(event)) return;
+  if (await shouldDrop(event)) return;
   try {
     const out = await shape(event);
     emitEvent(out);
@@ -284,6 +314,16 @@ async function main() {
   const auth = await web.auth.test();
   selfUserId = auth.user_id;
   console.error(`slack-listen: auth.test ok, user=${auth.user} (${selfUserId}), team=${auth.team}`);
+  if (BOT_TOKEN) {
+    try {
+      const botAuth = await new WebClient(BOT_TOKEN).auth.test();
+      botUserId = botAuth.user_id;
+      botId = botAuth.bot_id;
+      console.error(`slack-listen: bot auth.test ok, bot=${botAuth.user} (${botUserId}, ${botId})`);
+    } catch (err) {
+      console.error(`slack-listen: bot auth.test failed, bot posts will look like other people's: ${err.data?.error || err.message}`);
+    }
+  }
   console.error(`slack-listen: include_subtypes default=${INCLUDE_SUBTYPES_DEFAULT} (per-agent filter, set on the stream binary)`);
   await socket.start();
 }

@@ -66,6 +66,14 @@ describe('loadConfig', () => {
     assert.equal(sources.SLACK_APP_TOKEN, path.join(configDir, 'app-token'));
   });
 
+  it('reads the optional bot token from its own file', () => {
+    write(path.join(configDir, 'bot-token'), 'xoxb-file\n');
+    const env = {};
+    const sources = loadConfig({ env, envFile, configDir });
+    assert.equal(env.SLACK_BOT_TOKEN, 'xoxb-file');
+    assert.equal(sources.SLACK_BOT_TOKEN, path.join(configDir, 'bot-token'));
+  });
+
   it('*_FILE env vars point at a different token file', () => {
     const custom = path.join(SANDBOX, 'elsewhere', 'tok');
     write(custom, 'xoxp-custom\n');

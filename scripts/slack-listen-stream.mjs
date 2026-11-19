@@ -90,8 +90,11 @@ export function passesFilters(event, flags) {
   // Self filter
   if (event.is_self && !flags.watchSelf) return false;
   // Subtype filter — bot_id-bearing events (bot_message etc.) count as subtyped
-  // for the include-subtypes gate.
-  const subtypish = event.subtype || event.bot_id;
+  // for the include-subtypes gate, except our own bot's posts, which the
+  // self filter already covers. A bot post with a username override arrives
+  // as subtype bot_message.
+  const ownBotPost = event.is_self && event.bot_id && (!event.subtype || event.subtype === 'bot_message');
+  const subtypish = !ownBotPost && (event.subtype || event.bot_id);
   if (subtypish && !flags.includeSubtypes) return false;
   // Channel filter
   if (flags.channel && event.channel !== flags.channel) return false;

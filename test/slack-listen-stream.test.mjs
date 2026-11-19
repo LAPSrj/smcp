@@ -106,6 +106,16 @@ describe('passesFilters', () => {
     assert.equal(mod.passesFilters(botEvent, defaults), false);
   });
 
+  it('own bot posts follow the self filter, not the subtype filter', () => {
+    const ownBot = { ...baseEvent, bot_id: 'B123', is_self: true };
+    assert.equal(mod.passesFilters(ownBot, defaults), false);
+    assert.equal(mod.passesFilters(ownBot, { ...defaults, watchSelf: true }), true);
+    const ownBotOverride = { ...ownBot, subtype: 'bot_message' };
+    assert.equal(mod.passesFilters(ownBotOverride, { ...defaults, watchSelf: true }), true);
+    const ownBotEdit = { ...ownBot, subtype: 'message_changed' };
+    assert.equal(mod.passesFilters(ownBotEdit, { ...defaults, watchSelf: true }), false);
+  });
+
   it('--include-subtypes: keeps subtype + bot_id events', () => {
     const editEvent = { ...baseEvent, subtype: 'message_changed' };
     const botEvent = { ...baseEvent, bot_id: 'B123' };

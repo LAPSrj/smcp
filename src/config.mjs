@@ -15,6 +15,7 @@ export const CONFIG_DIR = path.join(os.homedir(), '.config', 'slack-self-mcp');
 const TOKEN_FILES = {
   SLACK_USER_TOKEN: { fileVar: 'SLACK_USER_TOKEN_FILE', name: 'user-token' },
   SLACK_APP_TOKEN: { fileVar: 'SLACK_APP_TOKEN_FILE', name: 'app-token' },
+  SLACK_BOT_TOKEN: { fileVar: 'SLACK_BOT_TOKEN_FILE', name: 'bot-token' },
 };
 
 export function tokenFilePath(key, { env = process.env, configDir = CONFIG_DIR } = {}) {
