@@ -20,6 +20,7 @@ import { WebClient } from '@slack/web-api';
 import { loadConfig, missingTokenHelp } from './config.mjs';
 import { resolveSendTarget, resolveUserId, searchTargets, lookupUserName } from './resolver.mjs';
 import { buildPermalink, parsePostAt, searchSlack, userInfo, SEARCH_MAX_LIMIT } from './messages.mjs';
+import { footerContent } from './mrkdwn.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
 import { STREAM_BINARY_PATH, buildMonitor, replyWatch } from './listen-command.mjs';
@@ -166,28 +167,38 @@ ensureSingleton().then((result) => {
   console.error(`slack-mcp: singleton ensure threw: ${err.message}`);
 });
 
-// Footer appended to text messages so recipients can tell the post came
-// through automation. Default `_— AI_` (italic). Set the env var to an empty
-// string to disable. Only applied when the caller-supplied text is non-empty.
-const FOOTER = process.env.SLACK_SEND_FOOTER ?? '_— AI_';
+// Footer under messages posted as the user, so recipients can tell they came
+// through automation. Default "*Sent using* <app name>"; an empty
+// SLACK_SEND_FOOTER disables it.
+const FOOTER = process.env.SLACK_SEND_FOOTER;
 
-function buildFooter(signature) {
-  if (!FOOTER) return '';
-  const sig = typeof signature === 'string' ? signature.trim() : '';
-  if (!sig) return FOOTER;
-  // Insert "(sig)" before the trailing italic underscore if the footer is
-  // wrapped in markdown italics; otherwise just append.
-  if (FOOTER.endsWith('_') && FOOTER.length > 1) {
-    return `${FOOTER.slice(0, -1)} (${sig})_`;
-  }
-  return `${FOOTER} (${sig})`;
+// The name Slack shows for the app's posts. bots.info needs users:read, which
+// the user token has and the bot token may not.
+let appNameCache = null;
+function appName() {
+  appNameCache ??= (async () => {
+    if (!bot) return 'AI';
+    try {
+      return (await slack.bots.info({ bot: (await bot.auth.test()).bot_id })).bot?.name || 'AI';
+    } catch (err) {
+      console.error(`slack-mcp: could not read the app name for the footer: ${formatSlackError(err)}`);
+      return 'AI';
+    }
+  })();
+  return appNameCache;
 }
 
-function withFooter(text, signature) {
-  if (!text) return text;
-  const f = buildFooter(signature);
-  if (!f) return text;
-  return `${text}\n${f}`;
+async function footerText(signature) {
+  if (FOOTER === '') return '';
+  const base = FOOTER ?? `*Sent using* ${await appName()}`;
+  const sig = typeof signature === 'string' ? signature.trim() : '';
+  return sig ? `${base} (${sig})` : base;
+}
+
+async function userContent(text, signature, markdown) {
+  if (!text) return null;
+  const footer = await footerText(signature);
+  return footer ? footerContent(text, footer, markdown) : messageContent(text, markdown);
 }
 
 const FORMAT_SCHEMA = {
@@ -202,7 +213,7 @@ const TOOLS = [
     description:
       'Send a Slack message, optionally with file attachments. ' +
       'If a bot token is configured, it posts as the bot; where the bot cannot post (DMs between people, group DMs, private channels it is not in), ' +
-      'it posts as the human user instead, with the footer. The result\'s posted_as says which ("bot" or "user"), and bot_error says why the bot failed. ' +
+      'it posts as the human user instead, with a "Sent using <app name>" footer. The result\'s posted_as says which ("bot" or "user"), and bot_error says why the bot failed. ' +
       'Set as to "bot" when the message must come from the bot (e.g. "DM X as the bot"): a person as the target then means the bot\'s own DM with them, ' +
       'and nothing is sent as the human if the bot can\'t post. as "user" always posts as the human. ' +
       'target accepts a single reference (#channel-name, channel ID C…/G…, @handle, user ID U…, email, or @me for the DM where you reach the human: ' +
@@ -269,9 +280,9 @@ const TOOLS = [
           type: 'string',
           description:
             'Optional self-identifier the calling agent can include if it wants to. ' +
-            'Appears in parentheses inside the footer marker, e.g. setting it to ' +
-            '"Claude Code" produces "_— AI (Claude Code)_". Only applied when the ' +
-            'footer itself is enabled and the message has text.',
+            'Appears in parentheses in the footer, e.g. setting it to ' +
+            '"Claude Code" produces "Sent using L.E.O (Claude Code)". Only applied to ' +
+            'posts made as the human, when the footer is enabled and the message has text.',
         },
       },
       required: ['target'],
@@ -294,7 +305,7 @@ const TOOLS = [
           type: 'string',
           description:
             'Optional self-identifier the calling agent can include if it wants to. ' +
-            'Appears in parentheses inside the footer marker, e.g. "_— AI (Claude Code)_".',
+            'Appears in parentheses in the footer, e.g. "Sent using L.E.O (Claude Code)".',
         },
       },
       required: ['channel_id', 'ts', 'text'],
@@ -590,14 +601,16 @@ async function handleSend(args) {
   let bot_error;
   if (bot && as !== 'user') {
     try {
-      sent = { ...(await post(bot, { channel_id, text, files, identity: BOT_IDENTITY, ...options })), posted_as: 'bot' };
+      const content = text ? messageContent(text, options.markdown) : null;
+      sent = { ...(await post(bot, { channel_id, content, files, identity: BOT_IDENTITY, ...options })), posted_as: 'bot' };
     } catch (err) {
       if (as === 'bot') return errorResult(formatSlackError(err), { channel_id, resolved_target: { type: resolution.type, display } });
       bot_error = formatSlackError(err);
     }
   }
   if (!sent) {
-    sent = { ...(await post(slack, { channel_id, text: withFooter(text, agent_signature), files, ...options })), posted_as: 'user' };
+    const content = await userContent(text, agent_signature, options.markdown);
+    sent = { ...(await post(slack, { channel_id, content, files, ...options })), posted_as: 'user' };
   }
   const resolved_target = { type: resolution.type, display };
 
@@ -634,9 +647,9 @@ function messageContent(text, markdown) {
 // Files go as ONE message (files.uploadV2) with text as its comment, and
 // uploadV2 doesn't return the share ts, so it is recovered from history.
 // Slack ignores username/icon_url on file shares, so identity is text-only.
-async function post(client, { channel_id, text, files, identity = {}, markdown, thread_ts, reply_broadcast, unfurl, postAt }) {
+async function post(client, { channel_id, content, files, identity = {}, thread_ts, reply_broadcast, unfurl, postAt }) {
   if (files.length === 0) {
-    const params = { channel: channel_id, ...messageContent(text, markdown) };
+    const params = { channel: channel_id, ...content };
     if (thread_ts) params.thread_ts = thread_ts;
     if (reply_broadcast) params.reply_broadcast = true;
     if (typeof unfurl === 'boolean') Object.assign(params, { unfurl_links: unfurl, unfurl_media: unfurl });
@@ -651,8 +664,9 @@ async function post(client, { channel_id, text, files, identity = {}, markdown, 
     channel_id,
     file_uploads: files.map((p) => ({ file: fs.createReadStream(p), filename: path.basename(p) })),
   };
-  if (text && markdown) uploadParams.blocks = [{ type: 'markdown', text }];
-  else if (text) uploadParams.initial_comment = text;
+  if (content?.blocks) uploadParams.blocks = content.blocks;
+  else if (content?.markdown_text) uploadParams.blocks = [{ type: 'markdown', text: content.markdown_text }];
+  else if (content?.text) uploadParams.initial_comment = content.text;
   if (thread_ts) uploadParams.thread_ts = thread_ts;
   const startedAt = Date.now() / 1000;
   const file_ids = extractFileIds(await client.files.uploadV2(uploadParams));
@@ -724,7 +738,7 @@ async function handleEdit(args) {
   if (!res) {
     edited_as = 'user';
     try {
-      res = await slack.chat.update({ channel: channel_id, ts, ...messageContent(withFooter(text, agent_signature), markdown) });
+      res = await slack.chat.update({ channel: channel_id, ts, ...(await userContent(text, agent_signature, markdown)) });
     } catch (err) {
       return errorResult(formatSlackError(err), bot_error ? { bot_error } : undefined);
     }

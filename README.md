@@ -55,7 +55,7 @@ The bot can only post where it is a member: any public channel (with
 `chat:write.public`), private channels it was invited to, and its own DMs.
 Slack doesn't let a bot post in a DM between two people or in a group DM,
 and returns `channel_not_found` there. When the bot fails for any reason, the
-send or edit is retried as you, with the footer. The result says which one
+send or edit is retried as you, with the footer (see §Footer). The result says which one
 posted (`posted_as` / `edited_as`) and, after a fallback, why the bot failed
 (`bot_error`).
 
@@ -642,44 +642,56 @@ error can see whether the file is where it expects.
    `slack_send(target=channel_id, thread_ts=parent_ts, text=…)` and the reply
    lands in-thread.
 
-## Footer marker
+## Footer
 
-Every outgoing message gets a footer appended on a new line so recipients can
-tell the post came through automation rather than a hand-typed message:
+Every message posted as you gets a footer so recipients can tell it came
+through automation. It is a context block, the small grey line under the
+message that Slack's own MCP uses for "Sent using Claude":
 
 ```
 your message text
-_— AI_
+Sent using L.E.O
 ```
 
-The default is `_— AI_` (markdown italic). Override or disable via env:
+The name is the app's name from its Basic Information page, read once with
+`bots.info` through the bot token's `bot_id`. Without a bot token, the
+footer says "Sent using AI". Override or disable it via env:
 
-- `SLACK_SEND_FOOTER="_— Claude_"` — custom marker
-- `SLACK_SEND_FOOTER=""` — disable entirely
+- `SLACK_SEND_FOOTER="*Sent using* Claude"`: custom footer text (Slack mrkdwn)
+- `SLACK_SEND_FOOTER=""`: no footer
 
-The footer is only appended when the caller-supplied text is non-empty (so
-file-only uploads with no caption stay caption-less). It is also re-applied
-on `slack_edit` so editing doesn't strip the marker.
+The footer is only added when the caller-supplied text is non-empty (so
+file-only uploads with no caption stay caption-less). `slack_edit` adds it
+again, so editing doesn't remove it.
+
+A Markdown message with the footer is sent as a `markdown` block, which
+Slack converts to rich text. Its `text`, which Slack shows in notifications
+and screen readers, is the same Markdown converted to Slack's mrkdwn with
+[marked](https://marked.js.org/)'s parser, plus the footer. Mentions
+(`<@U…>`, `<#C…>`, `<!here>`) and `<url|text>` links are kept as they
+are. A `format: "mrkdwn"` message is sent as section blocks, split at line
+breaks every 3000 characters (Slack's limit per section), and its `text` is
+the original text plus the footer.
 
 ### Agent signature
 
 Both `slack_send` and `slack_edit` accept an optional `agent_signature` string.
-If set, it is inserted in parentheses inside the footer:
+If set, it is added in parentheses at the end of the footer:
 
 ```
 your message text
-_— AI (Claude Code)_
+Sent using L.E.O (Claude Code)
 ```
 
-This is opt-in — agents that want to identify themselves can; agents that
-don't, won't. If `SLACK_SEND_FOOTER` is empty, the signature is also
-suppressed (no footer at all).
+This is opt-in, so agents that want to identify themselves can. If
+`SLACK_SEND_FOOTER` is empty, the signature is also suppressed (no footer
+at all).
 
-> Note: posts made as the human user (xoxp- token) don't get Slack's APP
-> badge, so the footer is the substitute. Posts made as the bot (see
-> §Posting as a bot) already show the bot's name and the APP badge, so they
-> get no footer and `agent_signature` is ignored for them.
-
+> Note: Slack already shows the app's name in the sidebar preview of a post
+> made as you, but not in the message itself, so the footer is what
+> recipients see in the conversation. Posts made as the bot (see §Posting as
+> a bot) show the bot's name and the APP badge, so they get no footer and
+> `agent_signature` is ignored for them.
 ## Notes / gotchas
 
 - `files_upload_v2` requires channel **IDs**, not names — the resolver always
@@ -705,6 +717,7 @@ slack-mcp/
 ├── src/
 │   ├── server.mjs               # MCP stdio server (slack_send / edit / history / mark_read / file_download / resolve / search / listen_instructions)
 │   ├── messages.mjs             # permalinks, search results, user profiles, post_at parsing
+│   ├── mrkdwn.mjs               # Markdown → mrkdwn notification text, footer blocks
 │   ├── mark-read.mjs            # forward-only read-position marking for slack_mark_read
 │   ├── config.mjs               # loads tokens from env → repo .env → ~/.config/slack-mcp/
 │   ├── resolver.mjs             # target → channel ID + fuzzy candidates
@@ -720,6 +733,7 @@ slack-mcp/
     ├── listener-singleton.test.mjs
     ├── mark-read.test.mjs
     ├── messages.test.mjs
+    ├── mrkdwn.test.mjs
     ├── resolver.test.mjs
     └── slack-listen-stream.test.mjs    # run all: `npm test`
 ```
