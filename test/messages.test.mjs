@@ -121,7 +121,7 @@ describe('userInfo', () => {
     users: {
       info: async () => ({
         user: {
-          id: 'U1', name: 'jack', real_name: 'Jack Smith', tz: 'America/Vancouver', tz_label: 'Pacific Standard Time',
+          id: 'U1', name: 'jack', real_name: 'Jack Smith', tz: 'Asia/Tokyo', tz_label: 'Japan Standard Time',
           is_restricted: true,
           profile: { title: 'PM', email: 'j@example.com', phone: '', status_text: 'Lunch', status_emoji: ':pizza:', status_expiration: 1795000000 },
         },
@@ -136,8 +136,8 @@ describe('userInfo', () => {
   it('returns title, timezone, local time, status and presence', async () => {
     const res = await userInfo(client('away'), 'U1', { now: new Date('2026-11-19T17:30:00Z') });
     assert.equal(res.title, 'PM');
-    assert.equal(res.tz, 'America/Vancouver');
-    assert.match(res.local_time, /09:30/);
+    assert.equal(res.tz, 'Asia/Tokyo');
+    assert.match(res.local_time, /2026-11-20, 02:30/);
     assert.equal(res.status_text, 'Lunch');
     assert.equal(res.status_expiration, new Date(1795000000 * 1000).toISOString());
     assert.equal(res.presence, 'away');
