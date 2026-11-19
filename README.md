@@ -723,3 +723,7 @@ slack-mcp/
     ├── resolver.test.mjs
     └── slack-listen-stream.test.mjs    # run all: `npm test`
 ```
+
+## License
+
+[PolyForm Strict License 1.0.0](LICENSE.md)

@@ -2,7 +2,7 @@
   "name": "smcp",
   "version": "0.1.0",
   "description": "Local MCP server that lets AI agents send and receive Slack messages — with file attachments — as the human user, plus a Socket Mode listener for inbound replies.",
-  "license": "MIT",
+  "license": "PolyForm-Strict-1.0.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/LAPSrj/smcp.git"
