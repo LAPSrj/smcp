@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { answeredBlocks, buildControls, formValues, isMultiple, multipleReplyBlocks, repliedNames, visibleTo } from '../src/controls.mjs';
+import { answeredBlocks, buildControls, formValues, isMultiple, isPoll, multipleReplyBlocks, pollAudience, pollBlocks, pollLayout, pollPicks, repliedNames, visibleTo } from '../src/controls.mjs';
 
 describe('buildControls', () => {
   it('returns no blocks without buttons or form', () => {
@@ -123,6 +123,80 @@ describe('multiple replies', () => {
   it('drops the buttons once everyone replied, and keeps them for everyone when members are unknown', () => {
     assert.equal(multipleReplyBlocks(controls, { replier: 'Ann', visible: [] }).some((b) => b.type === 'actions'), false);
     assert.equal(visibleTo(multipleReplyBlocks(controls, { replier: 'Ann', visible: null })), null);
+  });
+});
+
+describe('poll', () => {
+  const text = { type: 'rich_text', elements: [] };
+  const footer = { type: 'context', elements: [{ type: 'mrkdwn', text: '*Sent using* L.E.O' }] };
+  const start = [text, ...buildControls({ buttons: [{ id: 'home', label: 'Home', style: 'danger' }, { id: 'office', label: 'Office' }], replies: 'poll' }).blocks, footer];
+  const names = { U1: 'Ann Lee', U2: 'Bo Kim', U3: 'Cy Ode' };
+  const pick = (blocks, userId, choice, audience) => pollBlocks(blocks, { userId, userName: names[userId], choice, audience });
+  const own = (blocks, u) => blocks.find((b) => b.block_id?.startsWith(`poll:${u}|`));
+  const tableRows = (blocks) => blocks.find((b) => b.type === 'data_table').rows.map((r) => r.map((c) => c.text));
+
+  it('starts with "No replies yet" above plain buttons and needs buttons without a form', () => {
+    assert.deepEqual(start.map((b) => b.block_id ?? b.type), ['rich_text', 'poll_empty', 'poll', 'context']);
+    assert.match(buildControls({ buttons: [{ id: 'a', label: 'A' }], pollLayout: 'by_answer' }).error, /poll_layout/);
+    assert.match(buildControls({ buttons: [{ id: 'a', label: 'A' }], replies: 'poll', pollLayout: 'grid' }).error, /poll_layout/);
+    assert.equal(start[2].elements[0].style, undefined);
+    assert.match(buildControls({ form: [{ id: 'n', label: 'N' }], buttons: [{ id: 'a', label: 'A' }], replies: 'poll' }).error, /no form/);
+    assert.match(buildControls({ form: [{ id: 'n', label: 'N' }], replies: 'poll' }).error, /needs buttons/);
+  });
+
+  it('lists picks in a table, highlights each person\'s pick only for them and hides the shared row from them', () => {
+    const one = pick(start, 'U2', 'office', ['U1', 'U2', 'U3']);
+    assert.deepEqual(one.map((b) => b.block_id ?? b.type), ['rich_text', 'data_table', 'poll_counts', 'poll', 'poll:U2|Bo%20Kim|', 'context']);
+    assert.deepEqual(tableRows(one), [['Name', 'Answer'], ['Bo Kim', 'Office']]);
+    assert.deepEqual(pollAudience(one), ['U1', 'U3']);
+    assert.deepEqual(own(one, 'U2').elements.map((e) => [e.action_id, e.style, e.visible_to_user_ids]), [['home', undefined, ['U2']], ['office', 'primary', ['U2']]]);
+    const two = pick(one, 'U1', 'home', pollAudience(one));
+    assert.deepEqual(tableRows(two), [['Name', 'Answer'], ['Ann Lee', 'Home'], ['Bo Kim', 'Office']]);
+    assert.equal(two.find((b) => b.block_id === 'poll_counts').elements[0].text, 'Home: 1, Office: 1');
+    assert.deepEqual([...pollPicks(two)], [['U2', { pick: 'office', name: 'Bo Kim', note: null }], ['U1', { pick: 'home', name: 'Ann Lee', note: null }]]);
+  });
+
+  it('lets a person change their pick, and keeps working after everyone picked', () => {
+    let b = pick(start, 'U1', 'home', ['U1']);
+    assert.equal(b.some((x) => x.block_id === 'poll'), false);
+    assert.equal(isPoll(b), true);
+    b = pick(b, 'U1', 'office', null);
+    assert.deepEqual(tableRows(b), [['Name', 'Answer'], ['Ann Lee', 'Office']]);
+    assert.equal(own(b, 'U1').elements.find((e) => e.style === 'primary').action_id, 'office');
+  });
+
+  it('highlights the first 10 people and leaves the rest on the shared row', () => {
+    const ids = Array.from({ length: 11 }, (_, i) => `U${i + 10}`);
+    let b = start;
+    for (const id of ids) b = pollBlocks(b, { userId: id, userName: id, choice: 'home', audience: b === start ? ids : pollAudience(b) });
+    assert.equal(b.filter((x) => x.block_id?.startsWith('poll:')).length, 10);
+    assert.deepEqual(pollAudience(b), ['U20']);
+    assert.equal(tableRows(b).length, 12);
+  });
+
+  it('saves each person\'s note with their pick and shows it in the table', () => {
+    const noteStart = [text, ...buildControls({ buttons: [{ id: 'home', label: 'Home' }, { id: 'office', label: 'Office' }], replies: 'poll', pollNote: 'Note' }).blocks];
+    assert.deepEqual(noteStart.map((b) => b.block_id ?? b.type), ['rich_text', 'poll_empty', 'poll_note', 'poll']);
+    let b = pollBlocks(noteStart, { userId: 'U1', userName: 'Ann | Lee', choice: 'office', audience: null, note: 'in after lunch' });
+    b = pollBlocks(b, { userId: 'U2', userName: 'Bo Kim', choice: 'home', audience: null, note: '  ' });
+    assert.deepEqual(b.map((x) => x.block_id ?? x.type).slice(0, 5), ['rich_text', 'data_table', 'poll_counts', 'poll_note', 'poll']);
+    assert.deepEqual(tableRows(b), [['Name', 'Answer', 'Note'], ['Bo Kim', 'Home', ' '], ['Ann | Lee', 'Office', 'in after lunch']]);
+    assert.deepEqual(pollPicks(b).get('U1'), { pick: 'office', name: 'Ann | Lee', note: 'in after lunch' });
+    b = pollBlocks(b, { userId: 'U1', userName: 'Ann | Lee', choice: 'office', audience: null, note: '' });
+    assert.equal(pollPicks(b).get('U1').note, null);
+    const long = pollBlocks(noteStart, { userId: 'U1', userName: 'Ann', choice: 'home', audience: null, note: 'é'.repeat(100) });
+    assert.ok(long.every((x) => !x.block_id || x.block_id.length <= 255));
+    assert.match(buildControls({ buttons: [{ id: 'a', label: 'A' }], pollNote: 'Note' }).error, /poll_note/);
+  });
+
+  it('by_answer puts one column per choice with the names under it, padding short columns', () => {
+    const answerStart = [text, ...buildControls({ buttons: [{ id: 'home', label: 'Home' }, { id: 'office', label: 'Office' }], replies: 'poll', pollLayout: 'by_answer' }).blocks];
+    assert.equal(pollLayout(answerStart), 'by_answer');
+    let b = pick(answerStart, 'U1', 'office', null);
+    b = pick(b, 'U2', 'office', null);
+    b = pick(b, 'U3', 'home', null);
+    assert.equal(pollLayout(b), 'by_answer');
+    assert.deepEqual(tableRows(b), [['Home', 'Office'], ['Cy Ode', 'Ann Lee'], [' ', 'Bo Kim']]);
   });
 });
 

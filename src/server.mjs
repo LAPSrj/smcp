@@ -345,10 +345,24 @@ const TOOLS = [
         },
         replies: {
           type: 'string',
-          enum: ['single', 'multiple'],
+          enum: ['single', 'multiple', 'poll'],
           description:
             '"single" (default): the first click closes the form for everyone. "multiple": each person in the conversation can reply once; ' +
-            'their buttons disappear after they reply and the fields stay. Not with visible_to.',
+            'their buttons disappear after they reply and the fields stay. "poll": buttons only, one per choice; each person picks one and can change it, ' +
+            'a sortable table above the buttons lists everyone\'s pick with a count per choice, and each person sees their own pick highlighted. ' +
+            '"multiple" and "poll" don\'t work with visible_to.',
+        },
+        poll_layout: {
+          type: 'string',
+          enum: ['by_person', 'by_answer'],
+          description: 'With replies "poll": "by_person" (default) lists one row per person with their answer; "by_answer" has one column per choice with the names under it.',
+        },
+        poll_note: {
+          type: 'string',
+          description:
+            'With replies "poll": label of an optional note field above the buttons (e.g. "Note"), up to 100 characters per note. ' +
+            'Each pick saves the note typed at that moment, an empty field clears it, and the table shows it (a Note column by person, "Name (note)" by answer). ' +
+            'The click event has it as form.poll_note.',
         },
         agent_signature: {
           type: 'string',
@@ -702,7 +716,7 @@ function checkFormat(format) {
 }
 
 async function handleSend(args) {
-  const { target, text, file_paths, thread_ts, agent_signature, as = 'auto', format, reply_broadcast, unfurl, post_at, visible_to, buttons, form, replies } = args;
+  const { target, text, file_paths, thread_ts, agent_signature, as = 'auto', format, reply_broadcast, unfurl, post_at, visible_to, buttons, form, replies, poll_layout, poll_note } = args;
   if (!isValidTarget(target)) {
     return errorResult('target is required (string or non-empty array of strings)');
   }
@@ -717,11 +731,11 @@ async function handleSend(args) {
   }
   if (visible_to !== undefined) {
     if (typeof visible_to !== 'string' || !visible_to.trim()) return errorResult('visible_to must be a person reference (@handle, user ID, email or @me)');
-    if (files.length > 0 || reply_broadcast || unfurl !== undefined || post_at !== undefined || replies === 'multiple') {
-      return errorResult('visible_to (an ephemeral message) works on text messages only, not with file_paths, post_at, reply_broadcast, unfurl or replies "multiple"');
+    if (files.length > 0 || reply_broadcast || unfurl !== undefined || post_at !== undefined || replies === 'multiple' || replies === 'poll') {
+      return errorResult('visible_to (an ephemeral message) works on text messages only, not with file_paths, post_at, reply_broadcast, unfurl or replies "multiple" or "poll"');
     }
   }
-  const controls = buildControls({ buttons, form, replies });
+  const controls = buildControls({ buttons, form, replies, pollLayout: poll_layout, pollNote: poll_note });
   if (controls.error) return errorResult(controls.error);
   if (controls.blocks.length > 0) {
     if (files.length > 0) return errorResult('buttons and form work on text messages only, not with file_paths');

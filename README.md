@@ -93,7 +93,9 @@ slack_send(
   visible_to?: string,              // ephemeral: only this person sees it (@handle, user ID, email, @me)
   buttons?: { id, label, style?: "primary" | "danger", value? }[],   // 1-25, one row under the text
   form?: { id, label, type?, options?, initial?, placeholder? }[],    // 1-40 fields; type defaults to "text"
-  replies?: "single" | "multiple",  // default "single"; "multiple": one reply per person
+  replies?: "single" | "multiple" | "poll",  // default "single"; "multiple": one reply per person; "poll": pick one, changeable
+  poll_layout?: "by_person" | "by_answer",   // poll table: a row per person (default), or a column per answer
+  poll_note?: string,               // poll: label of an optional note field, shown as a Note column
 )
   → { channel_id, ts, permalink, file_ids?, posted_as: "bot" | "user", bot_error?, resolved_target, reply_watch: { hint, monitor } }
   → with post_at: { channel_id, scheduled_message_id, post_at, scheduled_as: "bot" | "user", bot_error?, resolved_target }
@@ -181,8 +183,31 @@ everyone else in the conversation (fetched with `conversations.members` on
 the first reply), and a `Replied by` line lists everyone who replied. Someone
 who joins the conversation later doesn't see the buttons.
 
+With `replies: "poll"` (buttons only, one per choice, no form), each person
+picks one choice and can change it later. The first pick replaces "No replies
+yet" with a Slack data table of everyone's pick, sortable and searchable,
+and a count per choice under it, both above the buttons. `poll_layout:
+"by_person"` (the default) has a Name and an Answer column, one row per
+person, grouped by answer. `"by_answer"` has one column per choice with the
+names under it. `poll_note` adds an optional note field above the buttons,
+labelled with its value (e.g. `"Note"`), for things like "in after lunch". A
+pick saves whatever is in the field at that moment (up to 100 characters), an
+empty field clears it, and the table shows it in a Note column, or as
+"Name (note)" in the `by_answer` layout. Each person's row of buttons has a
+block_id of `poll:<user ID>|<name>|<note>`, name and note URI-encoded and the
+note cut to fit Slack's 255-character limit, so the message itself holds
+everyone's name, pick and note. Each person who picked gets their own copy of the buttons, shown
+only to them with `visible_to_user_ids`, with their pick in the primary
+style. The shared row shows only to the members who haven't picked yet.
+Slack leaves about 8 px of blank space for each row a viewer can't see, so
+only the first 10 people who pick get their own row, which keeps that space
+under 80 px. Everyone after them keeps the shared row without their pick
+highlighted, and still appears in the table. Every click, a change included,
+reaches the agent as a `button_click` event.
+
 Buttons and forms work on text messages, including scheduled and ephemeral
-ones, but not with `file_paths`. A click on an ephemeral message doesn't
+ones, but not with `file_paths`. `replies` `"multiple"` and `"poll"` don't
+work on ephemeral messages. A click on an ephemeral message doesn't
 include the message, so `slack_send` saves an ephemeral form in
 `ephemeral-forms.jsonl` (see §Runtime files) and the listener rebuilds it from
 there. Slack drops an ephemeral message when the page reloads, form included.

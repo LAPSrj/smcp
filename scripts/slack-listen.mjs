@@ -45,7 +45,7 @@ import {
   writePidFile,
   clearSingletonFiles,
 } from '../src/listener-singleton.mjs';
-import { answeredBlocks, formValues, hasButtons, isMultiple, multipleReplyBlocks, visibleTo } from '../src/controls.mjs';
+import { answeredBlocks, formValues, hasButtons, isMultiple, isPoll, multipleReplyBlocks, pollAudience, pollBlocks, visibleTo } from '../src/controls.mjs';
 import { findEphemeralForm } from '../src/ephemeral-forms.mjs';
 
 const EVENTS_ROTATE_BYTES = 5 * 1024 * 1024; // 5 MB
@@ -292,6 +292,11 @@ async function confirmClick(body, event) {
   const message = body.message ?? (body.container?.is_ephemeral ? findEphemeralForm(event.ts) : null);
   if (!body.response_url || !hasButtons(message?.blocks)) return;
   const replier = personName({ real_name: event.user_real_name, name: event.user_name }, event.user);
+  if (isPoll(message.blocks)) {
+    const audience = pollAudience(message.blocks) ?? (await listMembers(event.channel));
+    const blocks = pollBlocks(message.blocks, { userId: event.user, userName: replier, choice: event.action_id, audience, note: event.form.poll_note ?? null });
+    return replaceMessage(body.response_url, event, message.text, blocks);
+  }
   if (isMultiple(message.blocks)) {
     const visible = await remainingRepliers(message.blocks, event);
     return replaceMessage(body.response_url, event, message.text, multipleReplyBlocks(message.blocks, { replier, visible }));
@@ -316,22 +321,26 @@ async function confirmClick(body, event) {
 // reply the conversation's members (without the bot, which can't click),
 // minus the person who clicked. null when the members can't be listed.
 async function remainingRepliers(blocks, event) {
-  let ids = visibleTo(blocks);
-  if (!ids) {
+  const ids = visibleTo(blocks) ?? (await listMembers(event.channel));
+  return ids === null ? null : ids.filter((id) => id !== event.user);
+}
+
+// The conversation's members who can click (the bot can't), or null when
+// neither token can list them.
+async function listMembers(channel) {
+  let ids;
+  try {
+    ids = await conversationMembers(web, channel);
+  } catch (err) {
+    if (!BOT_TOKEN) return null;
     try {
-      ids = await conversationMembers(web, event.channel);
-    } catch (err) {
-      if (!BOT_TOKEN) return null;
-      try {
-        ids = await conversationMembers(new WebClient(BOT_TOKEN), event.channel);
-      } catch (botErr) {
-        console.error(`slack-listen: can't list members of ${event.channel}, so the buttons stay visible to everyone: ${botErr.data?.error || botErr.message}`);
-        return null;
-      }
+      ids = await conversationMembers(new WebClient(BOT_TOKEN), channel);
+    } catch (botErr) {
+      console.error(`slack-listen: can't list members of ${channel}, so the buttons stay visible to everyone: ${botErr.data?.error || botErr.message}`);
+      return null;
     }
-    ids = ids.filter((id) => id !== botUserId);
   }
-  return ids.filter((id) => id !== event.user);
+  return ids.filter((id) => id !== botUserId);
 }
 
 async function conversationMembers(client, channel) {

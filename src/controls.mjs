@@ -113,14 +113,35 @@ function fieldElement(f) {
 
 export const SINGLE = 'buttons';
 export const MULTIPLE = 'buttons:multiple';
+export const POLL = 'poll';
+const POLL_PICK = 'poll:';
+const POLL_EMPTY = 'poll_empty';
+const POLL_COUNTS = 'poll_counts';
+const POLL_NOTE = 'poll_note';
+const NOTE_MAX = 100;
+// Each person's highlighted buttons are a row only they see, and Slack leaves
+// about 8 px of blank space for every row a viewer can't see. People past this
+// many keep the shared, unhighlighted row, which keeps that space under 80 px.
+const MAX_HIGHLIGHTED = 10;
 
 // Returns { blocks } (empty when neither is given) or { error }. A form
 // without buttons gets a Submit button, since only a click sends the values.
 // The button row's block_id records whether the message takes one reply or
 // one per person, so the listener can tell after a click.
-export function buildControls({ buttons, form, replies } = {}) {
-  if (replies !== undefined && replies !== 'single' && replies !== 'multiple') {
-    return { error: `replies must be "single" or "multiple" (got ${JSON.stringify(replies)})` };
+export const POLL_LAYOUTS = ['by_person', 'by_answer'];
+
+export function buildControls({ buttons, form, replies, pollLayout, pollNote } = {}) {
+  if (pollLayout !== undefined && (replies !== 'poll' || !POLL_LAYOUTS.includes(pollLayout))) {
+    return { error: 'poll_layout must be "by_person" or "by_answer", with replies "poll"' };
+  }
+  if (pollNote !== undefined && (replies !== 'poll' || !isText(pollNote, 2000))) {
+    return { error: 'poll_note must be the note field\'s label, with replies "poll"' };
+  }
+  if (replies !== undefined && !['single', 'multiple', 'poll'].includes(replies)) {
+    return { error: `replies must be "single", "multiple" or "poll" (got ${JSON.stringify(replies)})` };
+  }
+  if (replies === 'poll' && (form !== undefined || buttons === undefined)) {
+    return { error: 'replies "poll" needs buttons (one per choice) and no form' };
   }
   if (buttons === undefined && form === undefined) {
     return replies === undefined ? { blocks: [] } : { error: 'replies needs buttons or form' };
@@ -146,6 +167,21 @@ export function buildControls({ buttons, form, replies } = {}) {
   if (dup !== undefined) {
     const hint = buttons === undefined && dup === DEFAULT_SUBMIT.id ? ' (the default Submit button uses it; rename the field or pass buttons)' : '';
     return { error: `id "${dup}" is used twice; every button and field needs its own id${hint}` };
+  }
+  if (replies === 'poll') {
+    return {
+      blocks: [
+        { type: 'context', block_id: POLL_EMPTY + (pollLayout === 'by_answer' ? ':by_answer' : ''), elements: [{ type: 'mrkdwn', text: 'No replies yet' }] },
+        ...(pollNote === undefined ? [] : [{
+          type: 'input',
+          block_id: POLL_NOTE,
+          optional: true,
+          label: plain(pollNote),
+          element: { type: 'plain_text_input', action_id: POLL_NOTE, max_length: NOTE_MAX },
+        }]),
+        { type: 'actions', block_id: POLL, elements: btns.map((b) => buttonBlock({ ...b, style: undefined })) },
+      ],
+    };
   }
   return {
     blocks: [
@@ -222,8 +258,113 @@ export function isMultiple(blocks = []) {
   return blocks.some((b) => b.type === 'actions' && b.block_id === MULTIPLE);
 }
 
+const isPollRow = (b) => b.type === 'actions' && (b.block_id === POLL || b.block_id?.startsWith(POLL_PICK));
+
 export function hasButtons(blocks = []) {
-  return blocks.some((b) => b.type === 'actions' && (b.block_id === SINGLE || b.block_id === MULTIPLE));
+  return blocks.some((b) => b.type === 'actions' && [SINGLE, MULTIPLE].includes(b.block_id)) || isPoll(blocks);
+}
+
+// The shared row goes away once everyone picked, so a person's own row counts too.
+export function isPoll(blocks = []) {
+  return blocks.some(isPollRow);
+}
+
+// Each person's pick, from the button rows only they see, as user ID →
+// { pick, name, note }. A row's block_id is "poll:<user ID>|<name>|<note>",
+// name and note URI-encoded, so the message holds everyone's name and note
+// and the listener doesn't look anyone up again.
+export function pollPicks(blocks = []) {
+  const picks = new Map();
+  for (const b of blocks) {
+    if (b.type !== 'actions' || !b.block_id?.startsWith(POLL_PICK)) continue;
+    const pick = b.elements?.find((e) => e.style === 'primary')?.action_id;
+    const [id, name = '', note = ''] = b.block_id.slice(POLL_PICK.length).split('|');
+    if (pick) picks.set(id, { pick, name: decodeURIComponent(name) || id, note: decodeURIComponent(note) || null });
+  }
+  return picks;
+}
+
+// block_id is capped at 255 characters, so a long note is cut to fit.
+function pickBlockId(id, { name, note }) {
+  const head = `${POLL_PICK}${id}|${encodeURIComponent(name.slice(0, 80))}|`;
+  let text = note ?? '';
+  while (text && (head + encodeURIComponent(text)).length > 255) text = text.slice(0, -1);
+  return head + encodeURIComponent(text);
+}
+
+const isPollMarker = (b) => b.type === 'context' && (b.block_id?.startsWith(POLL_EMPTY) || b.block_id?.startsWith(POLL_COUNTS));
+
+export function pollLayout(blocks = []) {
+  return blocks.find(isPollMarker)?.block_id.endsWith(':by_answer') ? 'by_answer' : 'by_person';
+}
+
+// The IDs the shared row shows to, or null before anyone picked.
+export function pollAudience(blocks = []) {
+  const ids = blocks.find((b) => b.type === 'actions' && b.block_id === POLL)?.elements?.[0]?.visible_to_user_ids;
+  return Array.isArray(ids) ? ids : null;
+}
+
+const cell = (text) => ({ type: 'raw_text', text });
+
+// The poll after someone picks. A table lists everyone's pick: one row per
+// person (by_person) or one column per choice with the names under it
+// (by_answer), with the count per choice under it. Each person who picked
+// gets their own copy of the buttons with their pick highlighted, and the
+// shared row shows only to the rest of audience (the conversation's members;
+// null shows it to everyone).
+export function pollBlocks(blocks, { userId, userName, choice, audience, note = null }) {
+  const shared = { type: 'actions', block_id: POLL };
+  const template = blocks.find(isPollRow).elements.map(({ visible_to_user_ids, style, ...e }) => e);
+  const labels = new Map(template.map((e) => [e.action_id, e.text?.text ?? e.action_id]));
+  const layout = pollLayout(blocks);
+  const suffix = layout === 'by_answer' ? ':by_answer' : '';
+  const picks = pollPicks(blocks);
+  picks.delete(userId);
+  const highlighted = [...picks.keys()];
+  if (highlighted.length < MAX_HIGHLIGHTED) highlighted.push(userId);
+  picks.set(userId, { pick: choice, name: userName ?? userId, note: note?.trim() || null });
+  const noteField = blocks.find((b) => b.type === 'input' && b.block_id === POLL_NOTE);
+
+  const order = template.map((e) => e.action_id);
+  const rows = [...picks.values()].sort((a, b) => order.indexOf(a.pick) - order.indexOf(b.pick) || a.name.localeCompare(b.name));
+  const byChoice = order.map((id) => rows.filter((r) => r.pick === id).map((r) => (r.note ? `${r.name} (${r.note})` : r.name)));
+  const tallest = Math.max(...byChoice.map((names) => names.length));
+  const table = {
+    type: 'data_table',
+    caption: 'Replies',
+    page_size: 20,
+    rows: layout === 'by_answer'
+      // A cell can't be empty, so a shorter column is padded with a space.
+      ? [order.map((id) => cell(labels.get(id))), ...Array.from({ length: tallest }, (_, i) => byChoice.map((names) => cell(names[i] ?? ' ')))]
+      : noteField
+        ? [[cell('Name'), cell('Answer'), cell(noteField.label?.text ?? 'Note')], ...rows.map((r) => [cell(r.name), cell(labels.get(r.pick) ?? r.pick), cell(r.note ?? ' ')])]
+        : [[cell('Name'), cell('Answer')], ...rows.map((r) => [cell(r.name), cell(labels.get(r.pick) ?? r.pick)])],
+  };
+  const counts = order
+    .map((id) => [labels.get(id), rows.filter((r) => r.pick === id).length])
+    .filter(([, n]) => n > 0)
+    .map(([label, n]) => `${esc(label)}: ${n}`)
+    .join(', ');
+  const rest = audience === null ? null : audience.filter((id) => !highlighted.includes(id));
+  const sharedRow = rest === null ? { ...shared, elements: template }
+    : rest.length > 0 ? { ...shared, elements: template.map((e) => ({ ...e, visible_to_user_ids: rest })) }
+    : null;
+  const own = highlighted.map((u) => ({
+    type: 'actions',
+    block_id: pickBlockId(u, picks.get(u)),
+    elements: template.map((e) => ({ ...e, ...(e.action_id === picks.get(u).pick && { style: 'primary' }), visible_to_user_ids: [u] })),
+  }));
+  const pollPart = [
+    table,
+    { type: 'context', block_id: POLL_COUNTS + suffix, elements: [{ type: 'mrkdwn', text: counts }] },
+    ...(noteField ? [noteField] : []),
+    ...(sharedRow ? [sharedRow] : []),
+    ...own,
+  ];
+
+  const isPollBlock = (b) => b.type === 'data_table' || isPollMarker(b) || isPollRow(b) || b.block_id === POLL_NOTE;
+  const start = blocks.findIndex(isPollBlock);
+  return [...blocks.slice(0, start), ...pollPart, ...blocks.filter((b, i) => i > start && !isPollBlock(b))];
 }
 
 // The people already named in the "Replied by" line, as written there.
