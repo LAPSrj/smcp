@@ -45,6 +45,8 @@ import {
   writePidFile,
   clearSingletonFiles,
 } from '../src/listener-singleton.mjs';
+import { answeredBlocks, formValues, hasButtons, isMultiple, multipleReplyBlocks, visibleTo } from '../src/controls.mjs';
+import { findEphemeralForm } from '../src/ephemeral-forms.mjs';
 
 const EVENTS_ROTATE_BYTES = 5 * 1024 * 1024; // 5 MB
 const ECHO_RECHECK_MS = 6000;
@@ -146,7 +148,14 @@ async function lookupChannel(channelId) {
   if (!channelId) return null;
   if (channelCache.has(channelId)) return channelCache.get(channelId);
   try {
-    const res = await web.conversations.info({ channel: channelId });
+    let res;
+    try {
+      res = await web.conversations.info({ channel: channelId });
+    } catch (err) {
+      // The user token can't see conversations only the bot is in, such as people's DMs with the bot.
+      if (!BOT_TOKEN || err.data?.error !== 'channel_not_found') throw err;
+      res = await new WebClient(BOT_TOKEN).conversations.info({ channel: channelId });
+    }
     const c = res.channel;
     const entry = {
       name: c?.name ?? null,
@@ -184,8 +193,10 @@ function emitEvent(obj) {
   try {
     maybeRotateEvents();
     fs.appendFileSync(eventsPath(), JSON.stringify(obj) + '\n', { mode: 0o600 });
+    return true;
   } catch (err) {
     console.error(`slack-listen: emit failed: ${err.message}`);
+    return false;
   }
 }
 
@@ -203,13 +214,16 @@ function isOwnSendEcho(event) {
   return matchesRecentSend(recent, { channel: event.channel, ts: event.ts });
 }
 
+function channelLabel(channel, channelId) {
+  if (channel?.is_im) return '(dm)';
+  if (channel?.is_mpim) return '(mpim)';
+  if (channel?.name) return `#${channel.name}`;
+  return channelId;
+}
+
 async function shape(event) {
   const [user, channel] = await Promise.all([lookupUser(event.user), lookupChannel(event.channel)]);
-  let channel_label;
-  if (channel?.is_im) channel_label = '(dm)';
-  else if (channel?.is_mpim) channel_label = '(mpim)';
-  else if (channel?.name) channel_label = `#${channel.name}`;
-  else channel_label = event.channel;
+  const channel_label = channelLabel(channel, event.channel);
 
   const files = Array.isArray(event.files)
     ? event.files.map((f) => ({
@@ -234,6 +248,115 @@ async function shape(event) {
     bot_id: event.bot_id ?? null,
     files,
   };
+}
+
+// A button click on one of this app's messages. It takes the message's channel
+// and ts, so the stream's channel and thread filters apply to it as they do to
+// a reply. Other block actions (a select changing inside a form) don't fire,
+// because form fields are input blocks without dispatch_action.
+async function shapeClick(body) {
+  const action = body.actions?.[0];
+  if (action?.type !== 'button') return null;
+  const channelId = body.container?.channel_id ?? body.channel?.id ?? null;
+  const userId = body.user?.id ?? null;
+  const [user, channel] = await Promise.all([lookupUser(userId), lookupChannel(channelId)]);
+  const label = action.text?.text ?? action.action_id;
+  return {
+    kind: 'button_click',
+    ts: body.container?.message_ts ?? body.message?.ts ?? null,
+    channel: channelId,
+    channel_name: channelLabel(channel, channelId),
+    user: userId,
+    user_name: user?.name ?? null,
+    user_real_name: user?.real_name ?? null,
+    is_self: userId === selfUserId,
+    text: `clicked "${label}"`,
+    thread_ts: body.message?.thread_ts ?? null,
+    subtype: null,
+    bot_id: null,
+    files: [],
+    action_id: action.action_id ?? null,
+    value: action.value ?? null,
+    form: formValues(body.state?.values),
+  };
+}
+
+function personName(user, id) {
+  return user?.real_name || user?.name || id;
+}
+
+// Replaces the form with the answers through the click's response_url. It runs
+// only after the click is in events.jsonl, so a changed message tells the
+// person their answer was saved, and an unchanged one that it wasn't.
+async function confirmClick(body, event) {
+  const message = body.message ?? (body.container?.is_ephemeral ? findEphemeralForm(event.ts) : null);
+  if (!body.response_url || !hasButtons(message?.blocks)) return;
+  const replier = personName({ real_name: event.user_real_name, name: event.user_name }, event.user);
+  if (isMultiple(message.blocks)) {
+    const visible = await remainingRepliers(message.blocks, event);
+    return replaceMessage(body.response_url, event, message.text, multipleReplyBlocks(message.blocks, { replier, visible }));
+  }
+  const channel = await lookupChannel(event.channel);
+  const names = {};
+  for (const b of message.blocks) {
+    if (b.type !== 'input') continue;
+    const id = b.element?.action_id;
+    const v = event.form[id];
+    if (!v) continue;
+    // A name with "@" in front can become a mention and notify that person.
+    if (b.element.type === 'users_select') names[v] = personName(await lookupUser(v), v);
+    if (b.element.type === 'conversations_select') names[v] = channelLabel(await lookupChannel(v), v);
+  }
+  const clicked = body.actions?.[0]?.text?.text ?? event.action_id;
+  const repliedBy = channel?.is_im ? null : replier;
+  return replaceMessage(body.response_url, event, message.text, answeredBlocks(message.blocks, { values: event.form, clicked, repliedBy, names }));
+}
+
+// Who can still reply: the IDs the buttons already show to, or on the first
+// reply the conversation's members (without the bot, which can't click),
+// minus the person who clicked. null when the members can't be listed.
+async function remainingRepliers(blocks, event) {
+  let ids = visibleTo(blocks);
+  if (!ids) {
+    try {
+      ids = await conversationMembers(web, event.channel);
+    } catch (err) {
+      if (!BOT_TOKEN) return null;
+      try {
+        ids = await conversationMembers(new WebClient(BOT_TOKEN), event.channel);
+      } catch (botErr) {
+        console.error(`slack-listen: can't list members of ${event.channel}, so the buttons stay visible to everyone: ${botErr.data?.error || botErr.message}`);
+        return null;
+      }
+    }
+    ids = ids.filter((id) => id !== botUserId);
+  }
+  return ids.filter((id) => id !== event.user);
+}
+
+async function conversationMembers(client, channel) {
+  const ids = [];
+  let cursor;
+  do {
+    const res = await client.conversations.members({ channel, limit: 1000, cursor });
+    ids.push(...(res.members ?? []));
+    cursor = res.response_metadata?.next_cursor || undefined;
+  } while (cursor);
+  return ids;
+}
+
+async function replaceMessage(responseUrl, event, text, blocks) {
+  const res = await fetch(responseUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ replace_original: true, text: text ?? '', blocks }),
+  });
+  const reply = await res.text();
+  let accepted = reply.trim() === 'ok';
+  try { accepted ||= JSON.parse(reply).ok === true; } catch { /* plain-text error */ }
+  if (!res.ok || !accepted) {
+    console.error(`slack-listen: could not update the clicked message ${event.channel}/${event.ts}: HTTP ${res.status} ${reply.slice(0, 200)}`);
+  }
 }
 
 // Per-event drop decisions — only the structural ones. Per-agent filters
@@ -263,6 +386,15 @@ socket.on('slack_event', async ({ ack, type, body }) => {
     await ack();
   } catch (err) {
     console.error(`slack-listen: ack failed: ${err.message}`);
+  }
+  if (type === 'interactive' && body?.type === 'block_actions') {
+    try {
+      const out = await shapeClick(body);
+      if (out && emitEvent(out)) await confirmClick(body, out);
+    } catch (err) {
+      console.error(`slack-listen: click shape failed: ${err.message}`);
+    }
+    return;
   }
   if (type !== 'events_api') return;
   const event = body?.event;

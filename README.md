@@ -90,9 +90,14 @@ slack_send(
   reply_broadcast?: boolean,        // with thread_ts: also show the reply in the channel
   unfurl?: boolean,                 // link and media previews on/off; omit for Slack's default
   post_at?: number | string,        // schedule: Unix seconds or ISO 8601 with an offset
+  visible_to?: string,              // ephemeral: only this person sees it (@handle, user ID, email, @me)
+  buttons?: { id, label, style?: "primary" | "danger", value? }[],   // 1-25, one row under the text
+  form?: { id, label, type?, options?, initial?, placeholder? }[],    // 1-40 fields; type defaults to "text"
+  replies?: "single" | "multiple",  // default "single"; "multiple": one reply per person
 )
   → { channel_id, ts, permalink, file_ids?, posted_as: "bot" | "user", bot_error?, resolved_target, reply_watch: { hint, monitor } }
   → with post_at: { channel_id, scheduled_message_id, post_at, scheduled_as: "bot" | "user", bot_error?, resolved_target }
+  → with visible_to: { channel_id, message_ts, visible_to: { user_id, display }, posted_as: "bot" | "user", bot_error?, resolved_target }
   → on miss/ambiguity: { error: "no_match" | "ambiguous" | "not_a_user" | "too_many_users", input, candidates: [...], hint, failed_input?, more_available? }
 ```
 
@@ -133,10 +138,56 @@ tildes in Markdown) need `"mrkdwn"`.
 sending it now, as the bot first and then as you, like a normal send. Slack
 needs the time in the future and at most 120 days out. An ISO time without
 an offset is rejected, so the machine's timezone never applies by accident.
-The result has `scheduled_message_id` and no `ts`. You cancel or edit a
-scheduled message in Slack's "Drafts & sent" view. `post_at`,
+The result has `scheduled_message_id` and no `ts`. `slack_scheduled` lists
+the pending ones and `slack_delete` cancels one. `post_at`,
 `reply_broadcast` and `unfurl` work on text messages only, not with
 `file_paths`.
+
+`visible_to` posts an ephemeral message with `chat.postEphemeral`: only that
+person sees it, in the conversation `target` names, and they must be a member
+of it. It goes out as the bot first and then as you, like a normal send. Slack
+shows it only while the person has Slack open and drops it when they reload,
+so the result has `message_ts` and no `permalink` or `reply_watch`. It works
+on text messages only, not with `file_paths`, `post_at`, `reply_broadcast`,
+`unfurl`, `buttons` or `form`.
+
+`buttons` and `form` add buttons and form fields under the text, as Block
+Kit `actions` and `input` blocks. A field's `type` is `text`, `multiline`,
+`number`, `select`, `multi_select`, `checkboxes`, `radio`, `date`,
+`time`, `user` or `channel`; the four choice types take `options`. A form
+without `buttons` gets a Submit button with id `submit`. A click on any
+button reaches the listener as a `button_click` event (see §Listener) with
+the button's `action_id` and `value`, the clicker, and `form`: every field's
+value by field id. Slack doesn't enforce required fields in messages, so an
+empty field arrives as `null` (`[]` for the list types) and the agent checks
+the values.
+
+After the listener writes a click to `events.jsonl`, it replaces the message
+through the click's `response_url`. With `replies: "single"` (the default),
+each field becomes its answer as text and the buttons go away, so a message
+takes one click. If the row had several
+buttons, a line names the one clicked. In a channel or group DM, where anyone
+can click, the line says `Replied by` and the person's full name. Names go
+in without `@`, so they don't become mentions that notify anyone. The message changes only after
+the click is saved, so a form that doesn't change means the listener never
+got the click (Slack then shows its own error on the button). To report the
+outcome, the agent edits the message with `slack_edit`, which replaces the
+whole message, answers included.
+
+With `replies: "multiple"`, for a channel or group DM where several people
+should answer, the fields and buttons stay. After each reply the buttons are
+hidden from that person with the button's `visible_to_user_ids`, which lists
+everyone else in the conversation (fetched with `conversations.members` on
+the first reply), and a `Replied by` line lists everyone who replied. Someone
+who joins the conversation later doesn't see the buttons.
+
+Buttons and forms work on text messages, including scheduled and ephemeral
+ones, but not with `file_paths`. A click on an ephemeral message doesn't
+include the message, so `slack_send` saves an ephemeral form in
+`ephemeral-forms.jsonl` (see §Runtime files) and the listener rebuilds it from
+there. Slack drops an ephemeral message when the page reloads, form included.
+Buttons and forms need **Interactivity** turned on in the Slack app (see
+§Setup).
 
 Every successful send returns `reply_watch`, a reminder plus a ready-to-run
 `Monitor` spec (same shape as `slack_listen_instructions`) filtered with
@@ -161,7 +212,8 @@ slack_edit(channel_id: string, ts: string, text: string, format?: "markdown" | "
 Calls `chat.update`. Slack only lets each token edit its own messages, so it
 tries the bot token first and then the user token; the user token's API
 error is surfaced verbatim if both fail. `text`
-fully replaces the previous text (this is not a delta API). For threaded
+fully replaces the previous text (this is not a delta API), and the edit
+removes any buttons and form fields `slack_send` added. For threaded
 replies, `ts` is the reply's own `ts` (not the parent `thread_ts`).
 
 ### `slack_history`
@@ -251,8 +303,9 @@ slack_file_download(
 
 Downloads a Slack-hosted file (typically an attachment surfaced via
 `slack_history` or the listener) to local disk. The GET against `url_private`
-is authenticated with the user OAuth token; without `files:read` Slack returns
-a login HTML page rather than the bytes — this tool detects that and fails
+is authenticated with the user OAuth token, or with the bot token for files
+only the bot can see (people's DMs with the bot); without `files:read` Slack
+returns a login HTML page rather than the bytes — this tool detects that and fails
 loudly rather than writing HTML to disk.
 
 One of `file_id` / `url` is required. `file_id` is preferred — `files.info`
@@ -272,7 +325,8 @@ slack_listen_instructions(
   watch_self?: boolean,        // include events authored by the token-holder (default: drop)
   channel?: string,            // filter to one channel ID
   thread?: string,             // filter to one thread (matches thread_ts or parent ts)
-  include_subtypes?: boolean,  // include edits / joins / file_share / bot_message etc.
+  include_subtypes?: boolean,  // include edits / joins / bot_message etc. (people's file shares,
+                               // thread broadcasts and /me messages always pass)
 )
   → {
     monitor: { command, description, persistent, timeout_ms },
@@ -344,6 +398,109 @@ private channels, DMs and group DMs. `query` takes Slack's modifiers
 the search API doesn't return it as a field. It is keyword search only,
 without the claude.ai connector's semantic ranking.
 
+### `slack_delete`
+
+```ts
+slack_delete(channel_id: string, ts?: string, scheduled_message_id?: string)   // exactly one of ts / scheduled_message_id
+  → { channel_id, ts, conversation, deleted_as: "bot" | "user" }
+  → { channel_id, scheduled_message_id, conversation, deleted_as: "bot" | "user" }
+  → not authorized yet: { error, required_phrase }
+```
+
+Deletes a posted message with `chat.delete`, or cancels a scheduled one with
+`chat.deleteScheduledMessage`. Each token can only delete its own messages,
+so it tries the bot token first and then yours. Slack can't cancel a
+scheduled message within 60 seconds of its post time.
+
+Deleting can't be undone, so the tool runs only after you type a sentence
+naming the message in the chat, such as:
+
+```
+I authorize Slack to delete message 1795000000.000100 in #general
+I authorize Slack to cancel scheduled message Q0123ABCDEF in DM with @alex
+```
+
+The first call returns that sentence in `required_phrase`, and the agent asks
+you to type it. The server then looks for it in the messages you typed, in
+the Claude Code transcripts for the server's working directory
+(`$CLAUDE_CONFIG_DIR/projects/<folder>/*.jsonl`, or `~/.claude/projects/…`),
+so text the agent writes never counts. Set `SLACK_TRANSCRIPT_DIR` to read
+the transcripts from another folder.
+
+### `slack_scheduled`
+
+```ts
+slack_scheduled(target?: string | string[])   // same references as slack_history
+  → { scheduled: [{ scheduled_message_id, channel_id, channel, post_at, text, scheduled_as: "bot" | "user" }] }
+```
+
+Lists the messages Slack hasn't posted yet, oldest `post_at` first, with
+`chat.scheduledMessages.list` for the bot token and for yours. Slack returns
+only the messages each token scheduled itself, so messages you schedule in the
+Slack app don't appear. Slack can't edit a scheduled message, so to change one,
+cancel it with `slack_delete` and schedule the new text with `slack_send`.
+
+### `slack_unreads`
+
+```ts
+slack_unreads(days?: number, include_muted?: boolean)   // days: default 7, at most 30
+  → { since, complete, checked, conversations: Unread[], failed?: [{ channel_id, error }] }
+```
+
+`Unread` shape:
+
+```ts
+{
+  channel_id: string,
+  display: string,           // "#general", "DM with @alex", "group DM with @alex @sam @pat"
+  type: "public_channel" | "private_channel" | "im" | "mpim",
+  unread_count: number,
+  mentions: number,          // unread messages with <@you>; @here, @channel and group mentions don't count
+  last_read: string,         // pass as after_ts to slack_history to read them
+  newest: { ts, user, user_name, text, permalink }   // text cut to 200 characters
+}
+```
+
+Lists the channels, DMs and group DMs you're in that have messages newer
+than your read position, newest first. Slack reports unread counts only for
+DMs, and checking each conversation one by one is slow (about 400
+conversations took two minutes, mostly waiting out rate limits). So it
+searches for messages from the last `days` days with `search.messages` and
+calls `conversations.info` only for the conversations that had any.
+
+- Unread messages older than the window, and messages Slack hasn't indexed
+  yet, are missed. `complete: false` means the window had
+  more than 2,000 messages, so try fewer days.
+- Your own messages and thread replies don't count, because neither changes
+  what Slack shows as unread in the channel. So an unread thread reply,
+  even one that mentions you, isn't reported.
+- Muted channels are skipped unless `include_muted` is true.
+- Conversations only the bot is in (people's DMs with the bot) aren't
+  included.
+- `failed` lists conversations `conversations.info` refused, such as a DM
+  with a deactivated account.
+
+### `slack_set_status`
+
+```ts
+slack_set_status(
+  status_text?: string,              // "" clears it
+  status_emoji?: string,             // ":calendar:"; "" clears it
+  status_expiration?: number | string,   // Unix seconds or ISO 8601 with an offset; 0 = never
+  presence?: "auto" | "away",
+  dnd_minutes?: number,              // pause notifications; 0 ends the pause
+)
+  → { status?: { text, emoji, expires }, presence?, dnd?: { snoozed_until }, errors?: { status?, presence?, dnd? } }
+```
+
+Sets your own status (`users.profile.set`, needs `users.profile:write`),
+presence (`users.setPresence`, needs `users:write`) and Do Not Disturb
+(`dnd.setSnooze` / `dnd.endSnooze`, needs `dnd:write`). Pass only what
+should change. A part that fails, such as one whose scope is missing, is
+listed under `errors` and the others still apply. If every part fails, the
+call returns an error. `slack_resolve("@me", profile: true)` shows the
+current status and presence.
+
 ## Setup
 
 ### 1. Create the Slack app
@@ -352,7 +509,9 @@ without the claude.ai connector's semantic ranking.
    Name it (e.g. `claude-self`) and pick the target workspace.
 2. **Socket Mode** → enable. Generate an app-level token with the
    `connections:write` scope. Save the `xapp-…` token — this is
-   `SLACK_APP_TOKEN`.
+   `SLACK_APP_TOKEN`. Then turn on **Interactivity & Shortcuts**, so clicks
+   on `slack_send` buttons reach the listener. With Socket Mode it needs no
+   Request URL.
 3. **OAuth & Permissions** → under **User Token Scopes**, add:
    - `chat:write`
    - `files:write`
@@ -372,7 +531,10 @@ without the claude.ai connector's semantic ranking.
    - `files:read`         *(slack_file_download — files.info + url_private GET)*
    - `groups:write`       *(slack_mark_read on private channels; it also allows archive, rename, invite and kick in private channels you're in)*
    - `channels:write`     *(slack_mark_read on public channels; it also allows creating, archiving and renaming public channels and inviting and removing people)*
-   - `search:read`        *(slack_search)*
+   - `search:read`        *(slack_search, slack_unreads)*
+   - `users.profile:write` *(slack_set_status: status text, emoji and expiration)*
+   - `users:write`        *(slack_set_status: presence)*
+   - `dnd:write`          *(slack_set_status: Do Not Disturb)*
 
    **If you add scopes after the initial install, you must reinstall the app
    to the workspace** (Settings → Install App → Reinstall). When `groups:write`
@@ -390,6 +552,7 @@ without the claude.ai connector's semantic ranking.
      *(bot events below, and finding the ts of a file the bot posted)*
    - `im:read`, `mpim:read` *(reading people's DMs with the bot)*
    - `im:write` *(opening the bot's DM with someone, for `as: "bot"`)*
+   - `files:read` *(slack_file_download for files people send the bot)*
 4. **Event Subscriptions** → enable. Under **Subscribe to events on behalf
    of users**, add:
    - `message.channels`
@@ -543,6 +706,23 @@ Each stdout line is one shaped JSON event:
 }
 ```
 
+A click on a `slack_send` button arrives as the same shape with `kind:
+"button_click"`, the message's `ts` and `channel` (so `--channel` and
+`--thread` filter clicks the way they filter replies), the clicker as
+`user`, `text` like `clicked "Approve"`, and these extra fields:
+
+```json
+{
+  "kind": "button_click",
+  "action_id": "approve",
+  "value": "deploy-42",
+  "form": { "note": "Fixes the login bug", "env": "production", "when": null }
+}
+```
+
+Clicks pass without `--watch-self`, because the human's own clicks are the
+ones an agent usually waits for.
+
 Synthetic events for stream-health detection appear as
 `{"event":"slack_connected","at":<ms>}` and `{"event":"slack_disconnected","at":<ms>,"error":…}` —
 these always pass through any filter so consumers can detect gaps.
@@ -569,6 +749,7 @@ if `XDG_RUNTIME_DIR` is unset), parent dir `0700`, every file `0600`.
 |---|---|---|
 | `tokens.env` | MCP server | Tokens for the singleton (Monitor strips child env; this is the fallback) |
 | `recent-sends.jsonl` | MCP servers (shared) | Echo-suppression. Each successful `slack_send`/`slack_edit` appends `{ts,channel,sent_at}`; singleton drops matching events before they reach `events.jsonl`. TTL 5 min. |
+| `ephemeral-forms.jsonl` | MCP servers (shared) | Each ephemeral `slack_send` with buttons or a form, so the singleton can replace it after a click (Slack leaves the message out of the click). Kept a day. |
 | `listener.heartbeat` | Singleton | mtime touched every 10s; ensureRunning treats >30s as dead |
 | `listener.pid` | Singleton | Diagnostic — current singleton's pid |
 | `listener.spawn.lock` | ensureRunning | O_EXCL ephemeral lock during spawn; prevents concurrent double-spawn |
@@ -715,9 +896,13 @@ slack-mcp/
 ├── LICENSE
 ├── .env.example
 ├── src/
-│   ├── server.mjs               # MCP stdio server (slack_send / edit / history / mark_read / file_download / resolve / search / listen_instructions)
-│   ├── messages.mjs             # permalinks, search results, user profiles, post_at parsing
-│   ├── mrkdwn.mjs               # Markdown → mrkdwn notification text, footer blocks
+│   ├── server.mjs               # MCP stdio server (slack_send / edit / delete / history / mark_read / scheduled / unreads / set_status / file_download / resolve / search / listen_instructions)
+│   ├── messages.mjs             # permalinks, search results, user profiles, post_at parsing, scheduled lists, status
+│   ├── unreads.mjs              # search-driven unread check for slack_unreads
+│   ├── auth-guard.mjs           # typed-authorization check for slack_delete
+│   ├── mrkdwn.mjs               # Markdown → mrkdwn notification text, message blocks with footer
+│   ├── controls.mjs             # slack_send buttons and form fields, the values a click reports, the message after a click
+│   ├── ephemeral-forms.mjs      # saved ephemeral forms, for the listener to replace after a click
 │   ├── mark-read.mjs            # forward-only read-position marking for slack_mark_read
 │   ├── config.mjs               # loads tokens from env → repo .env → ~/.config/slack-mcp/
 │   ├── resolver.mjs             # target → channel ID + fuzzy candidates
@@ -728,13 +913,17 @@ slack-mcp/
 │   ├── slack-listen.mjs         # Singleton listener daemon — owns Socket Mode, writes events.jsonl
 │   └── slack-listen-stream.mjs  # Per-agent stream binary — tails+filters events.jsonl for one Monitor session
 └── test/
+    ├── auth-guard.test.mjs
     ├── config.test.mjs
+    ├── controls.test.mjs
+    ├── ephemeral-forms.test.mjs
     ├── recent-sends.test.mjs
     ├── listener-singleton.test.mjs
     ├── mark-read.test.mjs
     ├── messages.test.mjs
     ├── mrkdwn.test.mjs
     ├── resolver.test.mjs
+    ├── unreads.test.mjs
     └── slack-listen-stream.test.mjs    # run all: `npm test`
 ```
 

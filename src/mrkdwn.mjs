@@ -98,11 +98,13 @@ export function mrkdwnSections(text, max = SECTION_MAX) {
   return chunks.filter((t) => t.trim()).map((t) => ({ type: 'section', text: { type: 'mrkdwn', text: t } }));
 }
 
-// The footer goes in a context block, the small grey line Slack's own
-// "Sent using Claude" attribution uses. text is what Slack shows where blocks
-// can't be rendered, such as notifications.
-export function footerContent(text, footer, markdown) {
-  const context = { type: 'context', elements: [{ type: 'mrkdwn', text: footer }] };
-  if (markdown) return { text: `${markdownToMrkdwn(text)}\n${footer}`, blocks: [{ type: 'markdown', text }, context] };
-  return { text: `${text}\n${footer}`, blocks: [...mrkdwnSections(text), context] };
+// Text as blocks, then controls (buttons, form fields), then the footer in a
+// context block, the small grey line Slack's own "Sent using Claude"
+// attribution uses. text is what Slack shows where blocks can't be rendered,
+// such as notifications.
+export function messageBlocks(text, { markdown, footer, controls = [] }) {
+  const body = markdown ? [{ type: 'markdown', text }] : mrkdwnSections(text);
+  const plain = markdown ? markdownToMrkdwn(text) : text;
+  const context = footer ? [{ type: 'context', elements: [{ type: 'mrkdwn', text: footer }] }] : [];
+  return { text: footer ? `${plain}\n${footer}` : plain, blocks: [...body, ...controls, ...context] };
 }

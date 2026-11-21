@@ -52,6 +52,10 @@ describe('replyWatch', () => {
     assert.equal(passesFilters({ ts: '201.000', channel: 'C1', thread_ts: '100.000' }, flags), true);
   });
 
+  it('delivers replies with a file attached', () => {
+    assert.equal(passesFilters({ ts: '203.000', channel: 'C1', thread_ts: null, subtype: 'file_share' }, flags), true);
+  });
+
   it('drops messages from other channels', () => {
     assert.equal(passesFilters({ ts: '202.000', channel: 'C2', thread_ts: null }, flags), false);
   });

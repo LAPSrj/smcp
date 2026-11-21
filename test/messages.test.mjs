@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { buildPermalink, parsePostAt, searchSlack, threadTsFromPermalink, userInfo } from '../src/messages.mjs';
+import { buildPermalink, conversationDisplay, listScheduled, parsePostAt, searchSlack, setOwnStatus, threadTsFromPermalink, userInfo } from '../src/messages.mjs';
 
 const WS = 'https://example.slack.com/';
 
@@ -149,5 +149,66 @@ describe('userInfo', () => {
     const res = await userInfo(client(new Error('ratelimited')), 'U1');
     assert.equal(res.presence, null);
     assert.equal(res.name, 'jack');
+  });
+});
+
+describe('conversationDisplay', () => {
+  const lookupName = async (id) => (id === 'U2' ? { name: 'pat' } : null);
+  it('names channels, DMs and group DMs', async () => {
+    assert.equal(await conversationDisplay({ id: 'C1', name: 'general' }, lookupName), '#general');
+    assert.equal(await conversationDisplay({ id: 'D1', is_im: true, user: 'U2' }, lookupName), 'DM with @pat');
+    assert.equal(await conversationDisplay({ id: 'D2', is_im: true, user: 'U9' }, lookupName), 'DM with @U9');
+    assert.equal(
+      await conversationDisplay({ id: 'G1', is_mpim: true, name: 'mpdm-a--b-1', purpose: { value: 'Group messaging with: @sam @alex' } }, lookupName),
+      'group DM with @sam @alex',
+    );
+    assert.equal(await conversationDisplay({ id: 'G2', is_mpim: true, name: 'mpdm-a--b-1', purpose: { value: '' } }, lookupName), 'mpdm-a--b-1');
+  });
+});
+
+describe('listScheduled', () => {
+  const source = (as, pages) => {
+    let i = 0;
+    return {
+      as,
+      client: { chat: { scheduledMessages: { list: async (p) => ({ ...pages[i++], params: p }) } } },
+    };
+  };
+  it('merges every token\'s pages, oldest post_at first', async () => {
+    const bot = source('bot', [
+      { scheduled_messages: [{ id: 'Q2', channel_id: 'C1', post_at: 1795400000, text: 'later' }], response_metadata: { next_cursor: 'n' } },
+      { scheduled_messages: [{ id: 'Q3', channel_id: 'C1', post_at: 1795500000, text: 'last' }] },
+    ]);
+    const user = source('user', [{ scheduled_messages: [{ id: 'Q1', channel_id: 'D1', post_at: 1795300000, text: 'first' }] }]);
+    const res = await listScheduled([bot, user]);
+    assert.deepEqual(res.map((m) => [m.scheduled_message_id, m.scheduled_as]), [['Q1', 'user'], ['Q2', 'bot'], ['Q3', 'bot']]);
+    assert.equal(res[0].post_at, new Date(1795300000 * 1000).toISOString());
+  });
+});
+
+describe('setOwnStatus', () => {
+  const missing = () => Promise.reject(Object.assign(new Error('x'), { data: { error: 'missing_scope' } }));
+  it('sets only the parts passed, and reports a failing part without stopping the others', async () => {
+    const calls = [];
+    const client = {
+      users: {
+        profile: { set: async (p) => { calls.push(['profile', p]); return { profile: { status_text: 'Out', status_emoji: ':palm_tree:', status_expiration: 1795400000 } }; } },
+        setPresence: missing,
+      },
+      dnd: { setSnooze: async (p) => { calls.push(['snooze', p]); return { snooze_endtime: 1795303600 }; } },
+    };
+    const res = await setOwnStatus(client, { status_text: 'Out', status_emoji: ':palm_tree:', status_expiration: 1795400000, presence: 'away', dnd_minutes: 60 });
+    assert.deepEqual(JSON.parse(calls[0][1].profile), { status_text: 'Out', status_emoji: ':palm_tree:', status_expiration: 1795400000 });
+    assert.deepEqual(res.status, { text: 'Out', emoji: ':palm_tree:', expires: new Date(1795400000 * 1000).toISOString() });
+    assert.deepEqual(res.dnd, { snoozed_until: new Date(1795303600 * 1000).toISOString() });
+    assert.match(res.errors.presence, /users:write/);
+    assert.equal(res.presence, undefined);
+  });
+
+  it('ends the pause when dnd_minutes is 0', async () => {
+    let ended = false;
+    const res = await setOwnStatus({ dnd: { endSnooze: async () => { ended = true; return {}; } } }, { dnd_minutes: 0 });
+    assert.equal(ended, true);
+    assert.deepEqual(res, { dnd: { snoozed_until: null } });
   });
 });

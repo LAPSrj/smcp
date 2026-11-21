@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 
-import { footerContent, markdownToMrkdwn, mrkdwnSections } from '../src/mrkdwn.mjs';
+import { markdownToMrkdwn, messageBlocks, mrkdwnSections } from '../src/mrkdwn.mjs';
 
 describe('markdownToMrkdwn', () => {
   it('converts inline formatting', () => {
@@ -62,21 +62,32 @@ describe('mrkdwnSections', () => {
   });
 });
 
-describe('footerContent', () => {
+describe('messageBlocks', () => {
   const footer = '*Sent using* L.E.O';
   const context = { type: 'context', elements: [{ type: 'mrkdwn', text: footer }] };
 
   it('sends Markdown as a markdown block, with mrkdwn text for notifications', () => {
-    assert.deepEqual(footerContent('**hi** [x](https://x.com)', footer, true), {
+    assert.deepEqual(messageBlocks('**hi** [x](https://x.com)', { footer, markdown: true }), {
       text: '*hi* <https://x.com|x>\n*Sent using* L.E.O',
       blocks: [{ type: 'markdown', text: '**hi** [x](https://x.com)' }, context],
     });
   });
 
   it('sends mrkdwn as section blocks, with the same text for notifications', () => {
-    assert.deepEqual(footerContent('*hi*', footer, false), {
+    assert.deepEqual(messageBlocks('*hi*', { footer, markdown: false }), {
       text: '*hi*\n*Sent using* L.E.O',
       blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*hi*' } }, context],
     });
+  });
+
+  it('puts controls between the text and the footer, and leaves the footer out when there is none', () => {
+    const actions = { type: 'actions', elements: [] };
+    assert.deepEqual(messageBlocks('**hi**', { markdown: true, controls: [actions] }), {
+      text: '*hi*',
+      blocks: [{ type: 'markdown', text: '**hi**' }, actions],
+    });
+    assert.deepEqual(messageBlocks('**hi**', { markdown: true, footer, controls: [actions] }).blocks, [
+      { type: 'markdown', text: '**hi**' }, actions, context,
+    ]);
   });
 });

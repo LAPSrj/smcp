@@ -1,4 +1,4 @@
-// Permalinks, search and user profiles for the slack_* tools.
+// Permalinks, search, user profiles, scheduled messages and status for the slack_* tools.
 
 // Same URL chat.getPermalink returns, built locally to skip one API call per message.
 export function buildPermalink(workspaceUrl, channel, ts, thread_ts) {
@@ -18,7 +18,7 @@ export function threadTsFromPermalink(permalink) {
   }
 }
 
-function channelType(c = {}) {
+export function channelType(c = {}) {
   if (c.is_im) return 'im';
   if (c.is_mpim) return 'mpim';
   return c.is_private || c.is_group ? 'private_channel' : 'public_channel';
@@ -132,4 +132,90 @@ export async function userInfo(client, userId, { now = new Date() } = {}) {
     is_guest: !!(u.is_restricted || u.is_ultra_restricted),
     deleted: !!u.deleted,
   };
+}
+
+// A conversation's name for people: #channel, "DM with @pat", or the group
+// DM's member list, which Slack keeps in its purpose ("Group messaging with: @a @b").
+export async function conversationDisplay(c, lookupName) {
+  if (c.is_im) {
+    const u = c.user ? await lookupName(c.user) : null;
+    return `DM with @${u?.name ?? c.user ?? c.id}`;
+  }
+  if (c.is_mpim) {
+    const who = c.purpose?.value?.replace(/^[^:]*:\s*/, '').trim();
+    return who ? `group DM with ${who}` : c.name ?? c.id;
+  }
+  return c.name ? `#${c.name}` : c.id;
+}
+
+// Slack lists only the messages a token scheduled itself, so each token that
+// can schedule (bot and user) is asked separately.
+export async function listScheduled(sources, { channel } = {}) {
+  const out = [];
+  for (const { client, as } of sources) {
+    let cursor;
+    do {
+      const res = await client.chat.scheduledMessages.list({ ...(channel && { channel }), limit: 100, cursor });
+      for (const m of res.scheduled_messages ?? []) {
+        out.push({
+          scheduled_message_id: m.id,
+          channel_id: m.channel_id,
+          post_at: new Date(m.post_at * 1000).toISOString(),
+          text: (m.text ?? '').trimEnd(),
+          scheduled_as: as,
+        });
+      }
+      cursor = res.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+  }
+  return out.sort((a, b) => a.post_at.localeCompare(b.post_at));
+}
+
+function scopeError(err, scope) {
+  const code = err.data?.error ?? err.message;
+  return code === 'missing_scope'
+    ? `missing_scope: the user token needs ${scope}. Add it under User Token Scopes and reinstall the app.`
+    : code;
+}
+
+const isoOrNull = (secs) => (secs ? new Date(secs * 1000).toISOString() : null);
+
+// Each part (status, presence, Do Not Disturb) needs its own scope, so one
+// failing doesn't stop the others; failures are listed under errors.
+export async function setOwnStatus(client, { status_text, status_emoji, status_expiration, presence, dnd_minutes }) {
+  const out = {};
+  const errors = {};
+  const profile = Object.fromEntries(
+    Object.entries({ status_text, status_emoji, status_expiration }).filter(([, v]) => v !== undefined),
+  );
+  if (Object.keys(profile).length > 0) {
+    try {
+      const { profile: p = {} } = await client.users.profile.set({ profile: JSON.stringify(profile) });
+      out.status = { text: p.status_text || null, emoji: p.status_emoji || null, expires: isoOrNull(p.status_expiration) };
+    } catch (err) {
+      errors.status = scopeError(err, 'users.profile:write');
+    }
+  }
+  if (presence !== undefined) {
+    try {
+      await client.users.setPresence({ presence });
+      out.presence = presence;
+    } catch (err) {
+      errors.presence = scopeError(err, 'users:write');
+    }
+  }
+  if (dnd_minutes !== undefined) {
+    try {
+      if (dnd_minutes > 0) {
+        const res = await client.dnd.setSnooze({ num_minutes: dnd_minutes });
+        out.dnd = { snoozed_until: isoOrNull(res.snooze_endtime) };
+      } else {
+        await client.dnd.endSnooze();
+        out.dnd = { snoozed_until: null };
+      }
+    } catch (err) {
+      errors.dnd = scopeError(err, 'dnd:write');
+    }
+  }
+  return Object.keys(errors).length > 0 ? { ...out, errors } : out;
 }

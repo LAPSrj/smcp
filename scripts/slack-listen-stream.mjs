@@ -13,7 +13,8 @@
 //   --watch-self            include events authored by the token-holder
 //                           (default: drop them — matches today's listener)
 //   --no-self               explicit form of the default
-//   --include-subtypes      include subtype-bearing events (default: drop)
+//   --include-subtypes      include subtype-bearing events (default: drop,
+//                           except PERSON_SUBTYPES)
 //   --channel <C…>          filter to one channel ID
 //   --thread <ts>           filter to one thread (events whose thread_ts
 //                           matches, plus the parent itself whose own ts
@@ -35,6 +36,8 @@ import {
 
 const POLL_INTERVAL_MS = 100;       // tail poll cadence; sub-second latency
 const READ_CHUNK_BYTES = 64 * 1024;
+// Subtypes that are a message a person wrote, so they pass without --include-subtypes.
+export const PERSON_SUBTYPES = new Set(['file_share', 'thread_broadcast', 'me_message']);
 
 export function parseArgs(argv) {
   const out = {
@@ -76,7 +79,7 @@ function printHelp() {
   console.error('Usage: slack-listen-stream.mjs [options]');
   console.error('  --watch-self           include self-authored events (default: drop)');
   console.error('  --no-self              explicit form of default');
-  console.error('  --include-subtypes     include subtype-bearing events (default: drop)');
+  console.error('  --include-subtypes     include edits, joins, bot posts and other subtypes (default: drop)');
   console.error('  --channel <C…>         filter to one channel ID');
   console.error('  --thread <ts>          filter to one thread (matches thread_ts or parent ts)');
   console.error('  --events-file <path>   override events.jsonl path (testing)');
@@ -87,14 +90,16 @@ export function passesFilters(event, flags) {
   if (event && typeof event.event === 'string') return true;
   // Defensive: drop anything that isn't a shaped message event.
   if (!event || typeof event.ts !== 'string') return false;
-  // Self filter
-  if (event.is_self && !flags.watchSelf) return false;
+  // Self filter. A click is never an echo of our own post, and the human's
+  // clicks are the ones an agent waits for.
+  if (event.is_self && !flags.watchSelf && event.kind !== 'button_click') return false;
   // Subtype filter — bot_id-bearing events (bot_message etc.) count as subtyped
   // for the include-subtypes gate, except our own bot's posts, which the
   // self filter already covers. A bot post with a username override arrives
   // as subtype bot_message.
   const ownBotPost = event.is_self && event.bot_id && (!event.subtype || event.subtype === 'bot_message');
-  const subtypish = !ownBotPost && (event.subtype || event.bot_id);
+  const personPost = !event.bot_id && PERSON_SUBTYPES.has(event.subtype);
+  const subtypish = !ownBotPost && !personPost && (event.subtype || event.bot_id);
   if (subtypish && !flags.includeSubtypes) return false;
   // Channel filter
   if (flags.channel && event.channel !== flags.channel) return false;

@@ -91,6 +91,12 @@ describe('passesFilters', () => {
     assert.equal(mod.passesFilters(selfEvent, defaults), false);
   });
 
+  it('keeps the human\'s own button clicks without --watch-self, still filtered by channel', () => {
+    const click = { ...baseEvent, kind: 'button_click', is_self: true, action_id: 'approve' };
+    assert.equal(mod.passesFilters(click, defaults), true);
+    assert.equal(mod.passesFilters(click, { ...defaults, channel: 'C9' }), false);
+  });
+
   it('--watch-self: keeps is_self:true events', () => {
     const selfEvent = { ...baseEvent, is_self: true };
     assert.equal(mod.passesFilters(selfEvent, { ...defaults, watchSelf: true }), true);
@@ -114,6 +120,14 @@ describe('passesFilters', () => {
     assert.equal(mod.passesFilters(ownBotOverride, { ...defaults, watchSelf: true }), true);
     const ownBotEdit = { ...ownBot, subtype: 'message_changed' };
     assert.equal(mod.passesFilters(ownBotEdit, { ...defaults, watchSelf: true }), false);
+  });
+
+  it('default: keeps messages people write that carry a subtype', () => {
+    for (const subtype of ['file_share', 'thread_broadcast', 'me_message']) {
+      assert.equal(mod.passesFilters({ ...baseEvent, subtype }, defaults), true, subtype);
+    }
+    assert.equal(mod.passesFilters({ ...baseEvent, subtype: 'channel_join' }, defaults), false);
+    assert.equal(mod.passesFilters({ ...baseEvent, subtype: 'file_share', bot_id: 'B123' }, defaults), false);
   });
 
   it('--include-subtypes: keeps subtype + bot_id events', () => {

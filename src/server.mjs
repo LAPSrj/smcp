@@ -19,8 +19,12 @@ import { WebClient } from '@slack/web-api';
 
 import { loadConfig, missingTokenHelp } from './config.mjs';
 import { resolveSendTarget, resolveUserId, searchTargets, lookupUserName } from './resolver.mjs';
-import { buildPermalink, parsePostAt, searchSlack, userInfo, SEARCH_MAX_LIMIT } from './messages.mjs';
-import { footerContent } from './mrkdwn.mjs';
+import { buildPermalink, conversationDisplay, listScheduled, parsePostAt, searchSlack, setOwnStatus, userInfo, SEARCH_MAX_LIMIT } from './messages.mjs';
+import { findUnreads, DEFAULT_DAYS, MAX_DAYS } from './unreads.mjs';
+import { refusal, verifyAuthorization } from './auth-guard.mjs';
+import { buildControls } from './controls.mjs';
+import { recordEphemeralForm } from './ephemeral-forms.mjs';
+import { messageBlocks } from './mrkdwn.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
 import { STREAM_BINARY_PATH, buildMonitor, replyWatch } from './listen-command.mjs';
@@ -58,6 +62,12 @@ let workspaceUrlCache = null;
 async function workspaceUrl() {
   workspaceUrlCache ??= (await slack.auth.test()).url;
   return workspaceUrlCache;
+}
+
+let selfIdCache = null;
+async function selfUserId() {
+  selfIdCache ??= (await slack.auth.test()).user_id;
+  return selfIdCache;
 }
 
 // Optional bot token: sends and edits try it first and fall back to the user.
@@ -195,10 +205,11 @@ async function footerText(signature) {
   return sig ? `${base} (${sig})` : base;
 }
 
-async function userContent(text, signature, markdown) {
+async function userContent(text, signature, markdown, controls = []) {
   if (!text) return null;
   const footer = await footerText(signature);
-  return footer ? footerContent(text, footer, markdown) : messageContent(text, markdown);
+  if (footer || controls.length > 0) return messageBlocks(text, { markdown, footer, controls });
+  return messageContent(text, markdown);
 }
 
 const FORMAT_SCHEMA = {
@@ -227,6 +238,14 @@ const TOOLS = [
       'The result has the message permalink; give it to the human when you tell them you posted. ' +
       'Text is standard Markdown by default (**bold**, [text](url), tables, headings); set format "mrkdwn" for Slack\'s own syntax (*bold*). ' +
       'post_at schedules a text message instead of sending it now (no file_paths); it returns scheduled_message_id and no ts. ' +
+      'visible_to posts an ephemeral message that only that person sees, in the target conversation; it returns message_ts and no permalink. ' +
+      'buttons and form add buttons and form fields under the text. A click on any button arrives in the reply_watch Monitor as a kind "button_click" event ' +
+      'with action_id, value, the clicker, and form (every field\'s value by field id), on the message\'s channel and ts. Anyone who can see the message can click, so check user. ' +
+      'When the listener has saved a click, it replaces the fields with the answers and removes the buttons, so each message takes one click; ' +
+      'in a group conversation it also shows "Replied by" and the person\'s name. If the message doesn\'t change, the click never reached the listener. ' +
+      'To report the outcome, edit the message with slack_edit (that replaces the whole message, answers included). ' +
+      'A form without buttons gets a Submit button (id "submit"). Not with file_paths. ' +
+      'replies "multiple" (channels and group DMs) keeps the form open for everyone else: each person\'s buttons disappear once they reply, and a line lists who replied. ' +
       'If you expect a reply, start the Monitor in the result\'s reply_watch field right after sending; it delivers both top-level and thread replies in that conversation.',
     inputSchema: {
       type: 'object',
@@ -274,7 +293,62 @@ const TOOLS = [
           oneOf: [{ type: 'number' }, { type: 'string' }],
           description:
             'Schedule instead of sending now: Unix seconds, or an ISO 8601 time with its offset (e.g. "2026-11-19T09:00:00-08:00"). ' +
-            'Slack needs it in the future and at most 120 days out. Text messages only; a scheduled message is cancelled or edited in Slack\'s "Drafts & sent" view.',
+            'Slack needs it in the future and at most 120 days out. Text messages only. List pending ones with slack_scheduled and cancel one with slack_delete.',
+        },
+        visible_to: {
+          type: 'string',
+          description:
+            'Post an ephemeral message only this person sees (@handle, user ID, email, or @me for the human), in the conversation target names; ' +
+            'they must be a member of it. Slack shows it only while they have Slack open and drops it on reload, and it has no permalink. ' +
+            'Text messages only: not with file_paths, post_at, reply_broadcast, unfurl or replies "multiple". Buttons and form work.',
+        },
+        buttons: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 25,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'action_id the click event reports.' },
+              label: { type: 'string', description: 'Button text, at most 75 characters.' },
+              style: { type: 'string', enum: ['primary', 'danger'], description: 'primary is green, danger is red; omit for a plain button.' },
+              value: { type: 'string', description: 'Optional value the click event reports.' },
+            },
+            required: ['id', 'label'],
+          },
+          description: 'Buttons under the text (and under the form, if any), in one row.',
+        },
+        form: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 40,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Key of this field in the click event\'s form.' },
+              label: { type: 'string' },
+              type: {
+                type: 'string',
+                enum: ['text', 'multiline', 'number', 'select', 'multi_select', 'checkboxes', 'radio', 'date', 'time', 'user', 'channel'],
+                description: 'Default "text". date reports YYYY-MM-DD, time HH:mm, user a user ID, channel a channel ID, multi_select and checkboxes a list.',
+              },
+              options: { type: 'array', items: { type: 'string' }, description: 'Choices for select, multi_select, checkboxes and radio (1-100).' },
+              initial: {
+                oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+                description: 'Prefilled value: one of options, a list of options for multi_select and checkboxes, YYYY-MM-DD, HH:mm, a user ID or a channel ID.',
+              },
+              placeholder: { type: 'string', description: 'Grey hint inside the field (not for checkboxes or radio).' },
+            },
+            required: ['id', 'label'],
+          },
+          description: 'Form fields under the text. Their values arrive with the next button click. Slack lets any field be left empty (null, or [] for lists), so check the values.',
+        },
+        replies: {
+          type: 'string',
+          enum: ['single', 'multiple'],
+          description:
+            '"single" (default): the first click closes the form for everyone. "multiple": each person in the conversation can reply once; ' +
+            'their buttons disappear after they reply and the fields stay. Not with visible_to.',
         },
         agent_signature: {
           type: 'string',
@@ -293,7 +367,7 @@ const TOOLS = [
     description:
       'Edit a previously sent message via chat.update. Each token can only edit its own messages, so it tries the bot token first and then the user token; ' +
       'edited_as in the result says which one worked. ' +
-      'For threaded replies, ts is the reply\'s own ts (not the parent thread_ts). text fully replaces the previous text.',
+      'For threaded replies, ts is the reply\'s own ts (not the parent thread_ts). text fully replaces the previous text, and the edit also removes any buttons and form fields.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -402,8 +476,8 @@ const TOOLS = [
         include_subtypes: {
           type: 'boolean',
           description:
-            'Include subtype-bearing events (edits, joins, file_share, bot_message, etc.). ' +
-            'Default false — most agents only want plain message events.',
+            'Include subtype-bearing events (edits, joins, bot_message, etc.). ' +
+            'Default false. File shares, thread broadcasts and /me messages from people always pass.',
         },
       },
       additionalProperties: false,
@@ -414,10 +488,10 @@ const TOOLS = [
     description:
       'Download a Slack file (an attachment surfaced via slack_history or the listener) to local disk. ' +
       'Pass file_id (F…, preferred — looks up url_private + filename via files.info) or url (a https://files.slack.com/… url_private, used directly). ' +
-      'The GET is authenticated with the user OAuth token. ' +
+      'The GET is authenticated with the user OAuth token, or with the bot token for files only the bot can see (such as files in people\'s DMs with the bot). ' +
       'dest_path is recommended: pass an absolute file path, or an absolute directory (uses the original filename). ' +
       'If dest_path is omitted, the file lands in /tmp/<filename> — fine for an immediate Read but not durable; prefer specifying a real directory. ' +
-      'Requires files:read on the user token; missing_scope errors here mean the app needs reinstall.',
+      'Requires files:read on the user token, and on the bot token for the bot\'s files; missing_scope errors here mean the app needs reinstall.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -480,6 +554,87 @@ const TOOLS = [
       required: ['query'],
     },
   },
+  {
+    name: 'slack_delete',
+    description:
+      'Delete a posted message, or cancel a scheduled message before Slack posts it. ' +
+      'Pass channel_id with ts for a posted message, or channel_id with scheduled_message_id (from slack_send with post_at, or from slack_scheduled) for a scheduled one. ' +
+      'Each token can only delete its own messages, so it tries the bot token first and then the user token; deleted_as says which one worked. ' +
+      'Deleting can\'t be undone, so until the user has typed the authorization sentence in chat, the call is refused and the error gives that sentence. ' +
+      'Show it to the user, and after they send it, call again with the same arguments; the server checks the conversation transcript for it. ' +
+      'Slack can\'t cancel a scheduled message within 60 seconds of its post time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel_id: { type: 'string', description: 'Channel ID of the message (from slack_send, slack_history or slack_scheduled).' },
+        ts: { type: 'string', description: 'ts of the posted message to delete. For a thread reply, the reply\'s own ts.' },
+        scheduled_message_id: { type: 'string', description: 'ID of the scheduled message to cancel (Q…).' },
+      },
+      required: ['channel_id'],
+    },
+  },
+  {
+    name: 'slack_scheduled',
+    description:
+      'List scheduled messages Slack hasn\'t posted yet, with scheduled_message_id, channel_id, channel (its name), post_at, text and scheduled_as ("bot" or "user"). ' +
+      'Slack only returns messages scheduled through this server (slack_send with post_at), not ones scheduled in the Slack app. ' +
+      'Pass target to list one conversation only. Cancel one with slack_delete(channel_id, scheduled_message_id). ' +
+      'Slack can\'t edit a scheduled message, so to change one, cancel it and schedule the new text with slack_send.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' }, minItems: 1 },
+          ],
+          description: 'Optional. Same as slack_history: #channel, channel ID, @handle, user ID, email, @me, or an array of user references for an MPIM.',
+        },
+      },
+    },
+  },
+  {
+    name: 'slack_unreads',
+    description:
+      'List the conversations with messages the human user hasn\'t read (channels, DMs and group DMs they\'re in), newest first. ' +
+      'Each has channel_id, display, type, unread_count, mentions (unread messages that @-mention the user), last_read, ' +
+      'and the newest unread message (ts, user, user_name, text cut to 200 characters, permalink). ' +
+      'Read one with slack_history(target=channel_id, after_ts=last_read) and mark it read with slack_mark_read. ' +
+      `It searches messages from the last \`days\` days (default ${DEFAULT_DAYS}, at most ${MAX_DAYS}), so older unread messages, and messages Slack hasn't indexed yet (a few seconds), are missed; ` +
+      'complete false means the window had more messages than one call scans, so try fewer days. ' +
+      'Muted channels are skipped unless include_muted is true. Thread replies don\'t count, because they don\'t change a channel\'s read position. ' +
+      'Conversations only the bot is in (people\'s DMs with the bot) aren\'t included. failed lists conversations Slack wouldn\'t describe.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: { type: 'number', description: `How far back to look, in days. Default ${DEFAULT_DAYS}, at most ${MAX_DAYS}.` },
+        include_muted: { type: 'boolean', description: 'Also check muted channels. Default false.' },
+      },
+    },
+  },
+  {
+    name: 'slack_set_status',
+    description:
+      'Set the human user\'s own Slack status, presence or Do Not Disturb; pass only what should change. ' +
+      'status_text and status_emoji set the status (pass "" for both to clear it), and status_expiration sets when it clears. ' +
+      'presence "away" marks them away, and "auto" lets Slack decide from their activity. ' +
+      'dnd_minutes pauses notifications for that many minutes, and 0 ends the pause. ' +
+      'Each part needs its own user token scope (users.profile:write, users:write, dnd:write); a part that fails is listed under errors and the others still apply. ' +
+      'Read the current status and presence with slack_resolve(target="@me", profile=true).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status_text: { type: 'string', description: 'Status text, e.g. "In a meeting". "" clears it.' },
+        status_emoji: { type: 'string', description: 'Emoji code, e.g. ":calendar:". "" clears it.' },
+        status_expiration: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: 'When the status clears: Unix seconds, or ISO 8601 with its offset (e.g. "2026-11-19T17:00:00-08:00"). 0 means never.',
+        },
+        presence: { type: 'string', enum: ['auto', 'away'], description: '"away" or "auto".' },
+        dnd_minutes: { type: 'number', description: 'Pause notifications for this many minutes; 0 ends the pause.' },
+      },
+    },
+  },
 ];
 
 const server = new Server(
@@ -500,6 +655,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === 'slack_file_download') return await handleFileDownload(args);
     if (name === 'slack_resolve') return await handleResolve(args);
     if (name === 'slack_search') return await handleSearch(args);
+    if (name === 'slack_delete') return await handleDelete(args);
+    if (name === 'slack_scheduled') return await handleScheduled(args);
+    if (name === 'slack_unreads') return await handleUnreads(args);
+    if (name === 'slack_set_status') return await handleSetStatus(args);
     return errorResult(`unknown tool: ${name}`);
   } catch (err) {
     return errorResult(formatSlackError(err));
@@ -526,11 +685,13 @@ function errorResult(message, extra) {
 
 function formatSlackError(err) {
   const apiError = err?.data?.error;
-  const method = err?.data?.response_metadata?.scopes ? undefined : err?.data?.callstack ? undefined : undefined;
   const parts = [];
   if (err?.code) parts.push(`code=${err.code}`);
   if (apiError) parts.push(`slack_error=${apiError}`);
   if (err?.message) parts.push(err.message);
+  // invalid_blocks and similar errors say which block and field Slack rejected.
+  const details = err?.data?.response_metadata?.messages;
+  if (Array.isArray(details) && details.length > 0) parts.push(details.join('; '));
   return parts.length ? parts.join(' | ') : String(err);
 }
 
@@ -541,7 +702,7 @@ function checkFormat(format) {
 }
 
 async function handleSend(args) {
-  const { target, text, file_paths, thread_ts, agent_signature, as = 'auto', format, reply_broadcast, unfurl, post_at } = args;
+  const { target, text, file_paths, thread_ts, agent_signature, as = 'auto', format, reply_broadcast, unfurl, post_at, visible_to, buttons, form, replies } = args;
   if (!isValidTarget(target)) {
     return errorResult('target is required (string or non-empty array of strings)');
   }
@@ -554,6 +715,18 @@ async function handleSend(args) {
   if (files.length > 0 && (reply_broadcast || unfurl !== undefined || post_at !== undefined)) {
     return errorResult('reply_broadcast, unfurl and post_at work on text messages only, not with file_paths');
   }
+  if (visible_to !== undefined) {
+    if (typeof visible_to !== 'string' || !visible_to.trim()) return errorResult('visible_to must be a person reference (@handle, user ID, email or @me)');
+    if (files.length > 0 || reply_broadcast || unfurl !== undefined || post_at !== undefined || replies === 'multiple') {
+      return errorResult('visible_to (an ephemeral message) works on text messages only, not with file_paths, post_at, reply_broadcast, unfurl or replies "multiple"');
+    }
+  }
+  const controls = buildControls({ buttons, form, replies });
+  if (controls.error) return errorResult(controls.error);
+  if (controls.blocks.length > 0) {
+    if (files.length > 0) return errorResult('buttons and form work on text messages only, not with file_paths');
+    if (!text) return errorResult('buttons and form need text, which Slack shows above them and in notifications');
+  }
   let postAt;
   if (post_at !== undefined) {
     postAt = parsePostAt(post_at);
@@ -562,6 +735,14 @@ async function handleSend(args) {
     }
   }
   const options = { markdown: format !== 'mrkdwn', thread_ts, reply_broadcast, unfurl, postAt };
+  let viewer;
+  if (visible_to !== undefined) {
+    const r = await resolveUserId(slack, visible_to);
+    if (r.error) return ok(r);
+    options.ephemeralUser = r.user_id;
+    const u = await lookupUserName(slack, r.user_id);
+    viewer = { user_id: r.user_id, display: u?.name ? `@${u.name}` : r.user_id };
+  }
 
   for (const p of files) {
     if (typeof p !== 'string' || p.length === 0) return errorResult(`file_paths entry is not a string: ${JSON.stringify(p)}`);
@@ -599,9 +780,12 @@ async function handleSend(args) {
   // the footer.
   let sent = null;
   let bot_error;
+  let content;
   if (bot && as !== 'user') {
     try {
-      const content = text ? messageContent(text, options.markdown) : null;
+      content = !text ? null
+        : controls.blocks.length > 0 ? messageBlocks(text, { markdown: options.markdown, controls: controls.blocks })
+        : messageContent(text, options.markdown);
       sent = { ...(await post(bot, { channel_id, content, files, identity: BOT_IDENTITY, ...options })), posted_as: 'bot' };
     } catch (err) {
       if (as === 'bot') return errorResult(formatSlackError(err), { channel_id, resolved_target: { type: resolution.type, display } });
@@ -609,7 +793,7 @@ async function handleSend(args) {
     }
   }
   if (!sent) {
-    const content = await userContent(text, agent_signature, options.markdown);
+    content = await userContent(text, agent_signature, options.markdown, controls.blocks);
     sent = { ...(await post(slack, { channel_id, content, files, ...options })), posted_as: 'user' };
   }
   const resolved_target = { type: resolution.type, display };
@@ -620,6 +804,26 @@ async function handleSend(args) {
       scheduled_message_id: sent.scheduled_message_id,
       post_at: new Date(sent.post_at * 1000).toISOString(),
       scheduled_as: sent.posted_as,
+      ...(bot_error && { bot_error }),
+      resolved_target,
+    });
+  }
+
+  if (sent.message_ts) {
+    let form_error;
+    if (controls.blocks.length > 0) {
+      try {
+        recordEphemeralForm({ message_ts: sent.message_ts, channel: channel_id, text: content.text, blocks: content.blocks });
+      } catch (err) {
+        form_error = `could not save the form, so a click won't replace it: ${err.message}`;
+      }
+    }
+    return ok({
+      ...(form_error && { form_error }),
+      channel_id,
+      message_ts: sent.message_ts,
+      visible_to: viewer,
+      posted_as: sent.posted_as,
       ...(bot_error && { bot_error }),
       resolved_target,
     });
@@ -647,10 +851,14 @@ function messageContent(text, markdown) {
 // Files go as ONE message (files.uploadV2) with text as its comment, and
 // uploadV2 doesn't return the share ts, so it is recovered from history.
 // Slack ignores username/icon_url on file shares, so identity is text-only.
-async function post(client, { channel_id, content, files, identity = {}, thread_ts, reply_broadcast, unfurl, postAt }) {
+async function post(client, { channel_id, content, files, identity = {}, thread_ts, reply_broadcast, unfurl, postAt, ephemeralUser }) {
   if (files.length === 0) {
     const params = { channel: channel_id, ...content };
     if (thread_ts) params.thread_ts = thread_ts;
+    if (ephemeralUser) {
+      const res = await client.chat.postEphemeral({ ...params, ...identity, user: ephemeralUser });
+      return { message_ts: res.message_ts ?? null };
+    }
     if (reply_broadcast) params.reply_broadcast = true;
     if (typeof unfurl === 'boolean') Object.assign(params, { unfurl_links: unfurl, unfurl_media: unfurl });
     if (postAt !== undefined) {
@@ -875,7 +1083,8 @@ async function handleListenInstructions(args = {}) {
       'Architecture: one singleton listener daemon per machine owns the Slack Socket Mode connection and writes shaped events to events.jsonl. The Monitor command runs a per-agent stream binary that tails+filters that file. Each agent gets its own filtered stdout; the singleton is shared.',
       'Echoes of our own slack_send / slack_edit posts (as the user or as the bot) are deduped at the singleton before they reach events.jsonl (TTL 5 min, match on (channel, ts)). You never see your own posts come back regardless of watch_self. Other posts by the bot count as is_self, like the user\'s.',
       'watch_self:true surfaces events authored by the token-holder (the human, when typing in Slack client on a channel/MPIM the Slack platform delivers events for). Note: self-typed DMs are platform-quirky in user-token Socket Mode — Slack may not deliver them depending on channel kind. The flag controls our filtering; it does not change what Slack delivers.',
-      'include_subtypes:true surfaces edits, joins, file_share, bot_message, etc. Default drops them.',
+      'include_subtypes:true surfaces edits, joins, bot_message, etc. Default drops them. File shares, thread broadcasts and /me messages from people always pass.',
+      'A click on a slack_send button arrives as kind "button_click", with the message\'s channel and ts, user (the clicker), action_id, value and form ({ field id: value }). Clicks pass regardless of watch_self, so the human\'s own clicks arrive too.',
       'channel / thread are server-side filtered by the per-agent binary, so unrelated events never reach your stdout. Use thread to follow a single conversation.',
       'Tokens are NOT placed on any command line; the server publishes them to runtime_tokens_path (mode 0600 in $XDG_RUNTIME_DIR), and the singleton reads them as a fallback when its own env is stripped (Monitor child semantics).',
       'If the singleton is dead at call time, the server tries to re-spawn it inline. The singleton.ensure_result field reports what happened.',
@@ -894,8 +1103,17 @@ async function handleFileDownload(args) {
   let mimetype = null;
   let infoSize = null;
 
+  let token = USER_TOKEN;
   if (file_id) {
-    const info = await slack.files.info({ file: file_id });
+    let info;
+    try {
+      info = await slack.files.info({ file: file_id });
+    } catch (err) {
+      // The user token can't see files shared only where the bot is, such as people's DMs with the bot.
+      if (!bot || err.data?.error !== 'file_not_found') throw err;
+      info = await bot.files.info({ file: file_id });
+      token = BOT_TOKEN;
+    }
     const f = info.file;
     if (!f) return errorResult(`files.info returned no file for id=${file_id}`);
     if (!resolvedUrl) resolvedUrl = f.url_private ?? null;
@@ -940,19 +1158,20 @@ async function handleFileDownload(args) {
   const parent = path.dirname(target);
   fs.mkdirSync(parent, { recursive: true });
 
-  // Authenticated GET. url_private requires Bearer USER_TOKEN; without it Slack
+  // Authenticated GET. url_private requires a Bearer token that can see the file; without it Slack
   // serves a login HTML page (200) instead of the file bytes.
-  const res = await fetch(resolvedUrl, {
-    headers: { Authorization: `Bearer ${USER_TOKEN}` },
-    redirect: 'follow',
-  });
+  const get = (tok) => fetch(resolvedUrl, { headers: { Authorization: `Bearer ${tok}` }, redirect: 'follow' });
+  let res = await get(token);
+  if (!file_id && bot && (!res.ok || (res.headers.get('content-type') || '').includes('text/html'))) {
+    res = await get(BOT_TOKEN);
+  }
   if (!res.ok) {
     return errorResult(`download failed: HTTP ${res.status} ${res.statusText} for ${resolvedUrl}`);
   }
   const ctype = res.headers.get('content-type') || '';
   if (ctype.includes('text/html')) {
     return errorResult(
-      `download returned HTML (likely auth/scope issue — ensure files:read is on the user token and reinstall the app). content-type=${ctype}`,
+      `download returned HTML (likely auth/scope issue — ensure files:read is on the user and bot tokens and reinstall the app). content-type=${ctype}`,
     );
   }
   if (!res.body) {
@@ -995,6 +1214,117 @@ async function handleSearch(args) {
   const n = typeof limit === 'number' && Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), SEARCH_MAX_LIMIT) : 20;
   const p = typeof page === 'number' && Number.isFinite(page) ? Math.max(Math.floor(page), 1) : 1;
   return ok(await searchSlack(slack, { query: query.trim(), content, sort, sort_dir, limit: n, page: p }));
+}
+
+const labelCache = new Map();
+// A conversation's name for people, from whichever token can see it.
+async function conversationLabel(channel_id) {
+  if (labelCache.has(channel_id)) return labelCache.get(channel_id);
+  for (const client of [slack, bot].filter(Boolean)) {
+    try {
+      const { channel } = await client.conversations.info({ channel: channel_id });
+      const label = await conversationDisplay(channel, (id) => lookupUserName(slack, id));
+      labelCache.set(channel_id, label);
+      return label;
+    } catch {
+      // try the next token
+    }
+  }
+  return channel_id;
+}
+
+async function handleDelete(args) {
+  const { channel_id, ts, scheduled_message_id } = args;
+  if (typeof channel_id !== 'string' || !channel_id) return errorResult('channel_id is required');
+  if ((ts === undefined) === (scheduled_message_id === undefined)) {
+    return errorResult('pass exactly one of ts (a posted message) or scheduled_message_id (a scheduled one)');
+  }
+  if (ts !== undefined && (typeof ts !== 'string' || !TS_PATTERN.test(ts))) return errorResult(`ts must be a Slack timestamp like 1794248982.212609 (got ${JSON.stringify(ts)})`);
+  if (scheduled_message_id !== undefined && (typeof scheduled_message_id !== 'string' || !scheduled_message_id)) {
+    return errorResult('scheduled_message_id must be a non-empty string');
+  }
+
+  const where = await conversationLabel(channel_id);
+  const [action, label] = ts ? ['delete', `message ${ts} in ${where}`] : ['cancel', `scheduled message ${scheduled_message_id} in ${where}`];
+  const auth = verifyAuthorization(action, label);
+  if (!auth.authorized) return errorResult(refusal(action, label, auth), { required_phrase: auth.requiredPhrase });
+
+  const remove = (client) =>
+    ts ? client.chat.delete({ channel: channel_id, ts }) : client.chat.deleteScheduledMessage({ channel: channel_id, scheduled_message_id });
+  let deleted_as = null;
+  let bot_error;
+  if (bot) {
+    try {
+      await remove(bot);
+      deleted_as = 'bot';
+    } catch (err) {
+      bot_error = formatSlackError(err);
+    }
+  }
+  if (!deleted_as) {
+    try {
+      await remove(slack);
+      deleted_as = 'user';
+    } catch (err) {
+      return errorResult(formatSlackError(err), bot_error ? { bot_error } : undefined);
+    }
+  }
+  return ok({ channel_id, ...(ts ? { ts } : { scheduled_message_id }), conversation: where, deleted_as });
+}
+
+async function handleScheduled(args) {
+  const { target } = args;
+  let channel;
+  if (target !== undefined) {
+    if (!isValidTarget(target)) return errorResult('target must be a string or non-empty array of strings');
+    const { resolution } = await resolveConversation(target);
+    if (resolution.error) return ok(resolution);
+    channel = resolution.channel_id;
+  }
+  const sources = [...(bot ? [{ client: bot, as: 'bot' }] : []), { client: slack, as: 'user' }];
+  const scheduled = await listScheduled(sources, { channel });
+  for (const m of scheduled) m.channel = await conversationLabel(m.channel_id);
+  return ok({ scheduled });
+}
+
+async function handleUnreads(args) {
+  const { days = DEFAULT_DAYS, include_muted = false } = args;
+  if (typeof days !== 'number' || !Number.isFinite(days) || days <= 0 || days > MAX_DAYS) {
+    return errorResult(`days must be a number above 0 and at most ${MAX_DAYS} (got ${JSON.stringify(days)})`);
+  }
+  return ok(
+    await findUnreads(slack, {
+      selfId: await selfUserId(),
+      lookupName: (id) => lookupUserName(slack, id),
+      days,
+      includeMuted: include_muted === true,
+    }),
+  );
+}
+
+async function handleSetStatus(args) {
+  const { status_text, status_emoji, status_expiration, presence, dnd_minutes } = args;
+  if ([status_text, status_emoji, status_expiration, presence, dnd_minutes].every((v) => v === undefined)) {
+    return errorResult('pass at least one of status_text, status_emoji, status_expiration, presence or dnd_minutes');
+  }
+  if (status_text !== undefined && typeof status_text !== 'string') return errorResult('status_text must be a string');
+  if (status_emoji !== undefined && (typeof status_emoji !== 'string' || !/^(:[^:\s]+:)?$/.test(status_emoji))) {
+    return errorResult(`status_emoji must be an emoji code like ":calendar:", or "" to clear it (got ${JSON.stringify(status_emoji)})`);
+  }
+  let expiration;
+  if (status_expiration !== undefined) {
+    expiration = parsePostAt(status_expiration);
+    if (expiration === null) {
+      return errorResult(`status_expiration must be Unix seconds, 0, or an ISO 8601 time with an offset (got ${JSON.stringify(status_expiration)})`);
+    }
+  }
+  if (presence !== undefined && !['auto', 'away'].includes(presence)) return errorResult(`presence must be "auto" or "away" (got ${JSON.stringify(presence)})`);
+  if (dnd_minutes !== undefined && (!Number.isInteger(dnd_minutes) || dnd_minutes < 0)) {
+    return errorResult(`dnd_minutes must be a whole number of minutes, 0 or more (got ${JSON.stringify(dnd_minutes)})`);
+  }
+  const res = await setOwnStatus(slack, { status_text, status_emoji, status_expiration: expiration, presence, dnd_minutes });
+  if (res.errors && Object.keys(res).length === 1) return errorResult('nothing changed', { errors: res.errors });
+  return ok(res);
 }
 
 const transport = new StdioServerTransport();
